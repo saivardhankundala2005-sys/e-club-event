@@ -51,7 +51,10 @@ export async function submitAudienceRatingAction(payload: {
     return { error: 'You are not allowed to vote on pitches from your own team or pool.' };
   }
 
-  // Check if team already voted on this pitch
+  // Check if team already voted on this pitch (fast-path UX check — the
+  // real guarantee against a double-tap/double-submit race is the
+  // UNIQUE(voting_team_id, pitch_id, criterion) DB constraint below, since
+  // this check and the insert are not atomic).
   const { data: existing } = await adminSupabase
     .from('audience_scores')
     .select('id')
@@ -70,13 +73,25 @@ export async function submitAudienceRatingAction(payload: {
     { criterion: 'overall_potential', score: Math.max(1, Math.min(Number(scores.overall_potential) || 1, 5)) },
   ];
 
-  for (const entry of entries) {
-    await adminSupabase.from('audience_scores').insert({
+  const { error: insertErr } = await adminSupabase.from('audience_scores').insert(
+    entries.map((entry) => ({
       voting_team_id: votingTeam.id,
       pitch_id: sanitizedPitchId,
       criterion: entry.criterion as any,
       score: entry.score,
-    });
+    }))
+  );
+
+  if (insertErr) {
+    // 23505 = unique_violation: a concurrent double-submit from the same
+    // team already inserted these rows first. Treat as success (idempotent)
+    // rather than surfacing a confusing duplicate-key error to the user.
+    if (insertErr.code === '23505') {
+      revalidatePath('/portal/team');
+      revalidatePath('/portal/organiser');
+      return { success: true };
+    }
+    return { error: 'Failed to submit rating: ' + insertErr.message };
   }
 
   revalidatePath('/portal/team');
@@ -109,6 +124,23 @@ export async function submitQuestionAction(payload: { pitchId: string; questionT
     .single();
 
   if (!team) return { error: 'Team profile not found.' };
+
+  // Double-submit guard: on a double-tap (common on bad event wifi), reject
+  // an identical question from the same team for the same pitch submitted
+  // in the last 10 seconds instead of creating a duplicate queue entry.
+  const tenSecondsAgo = new Date(Date.now() - 10_000).toISOString();
+  const { data: recentDuplicate } = await adminSupabase
+    .from('questions')
+    .select('id')
+    .eq('asking_team_id', team.id)
+    .eq('pitch_id', sanitizedPitchId)
+    .eq('question_text', sanitizedQuestionText)
+    .gte('created_at', tenSecondsAgo)
+    .maybeSingle();
+
+  if (recentDuplicate) {
+    return { success: true };
+  }
 
   const { error } = await adminSupabase.from('questions').insert({
     asking_team_id: team.id,

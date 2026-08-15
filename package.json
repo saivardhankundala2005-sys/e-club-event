@@ -6,7 +6,14 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "smoke-test": "node scripts/smoke-test.js",
+    "test-double-submit": "node scripts/test-double-submit.js",
+    "test-judge-lock": "node scripts/test-judge-lock.js",
+    "test-checklist-1": "node scripts/test-pre-event-checklist.js",
+    "test-checklist-2": "node scripts/test-pre-event-checklist-2.js",
+    "test-load-resilience": "node scripts/test-load-resilience.js",
+    "pre-event-check": "npm run smoke-test && npm run test-double-submit && npm run test-judge-lock && npm run test-checklist-1 && npm run test-checklist-2 && npm run test-load-resilience && npm run build && npm run lint"
   },
   "dependencies": {
     "@react-three/drei": "^9.114.3",

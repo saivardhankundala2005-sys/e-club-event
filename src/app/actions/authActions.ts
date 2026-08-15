@@ -91,6 +91,20 @@ export async function registerTeamAction(payload: {
     return { error: 'User is not authenticated. Please verify OTP first.' };
   }
 
+  // 3b. ABUSE PROTECTION: block one authenticated identity from registering
+  // more than one team (open email domain means no other natural cap on
+  // repeat/spam registrations). Backed by a UNIQUE(auth_user_id) DB
+  // constraint; this is just a friendlier pre-check.
+  const { data: existingTeam } = await adminSupabase
+    .from('teams')
+    .select('id, team_name')
+    .eq('auth_user_id', user.id)
+    .maybeSingle();
+
+  if (existingTeam) {
+    return { error: `You have already registered a team ("${existingTeam.team_name}"). Each account may register only one team.` };
+  }
+
   // 4. Random Domain Selection from `domains` table
   const { data: domains, error: domainErr } = await adminSupabase.from('domains').select('name');
   if (domainErr || !domains || domains.length === 0) {
@@ -128,6 +142,9 @@ export async function registerTeamAction(payload: {
 
   if (teamErr || !team) {
     if (teamErr?.code === '23505') {
+      if (teamErr.message?.includes('teams_auth_user_id_unique')) {
+        return { error: 'You have already registered a team. Each account may register only one team.' };
+      }
       return { error: 'A team with this name is already registered.' };
     }
     return { error: teamErr?.message || 'Failed to create team.' };
