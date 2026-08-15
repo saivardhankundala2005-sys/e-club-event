@@ -98,6 +98,12 @@ ALTER TABLE public.otp_request_log ENABLE ROW LEVEL SECURITY;
 -- ============================================================
 -- 2. JUDGE SLIDER SCALE: 0-10 in, weighted on the way out
 -- ============================================================
+-- The live pitch_leaderboard view still reads the old pre-weighted
+-- columns directly, so Postgres blocks dropping them below with a
+-- dependency error. Drop the view now; it's recreated from scratch in
+-- section 6 further down, after the new columns exist.
+DROP VIEW IF EXISTS public.pitch_leaderboard;
+
 -- pitch_scores currently stores category scores already pre-weighted
 -- (0-20 / 0-15). Add raw 0-10 columns; keep the weighted columns as
 -- generated values so pitch_leaderboard and any other reader don't need
@@ -121,13 +127,21 @@ ALTER TABLE public.pitch_scores
   ALTER COLUMN problem_market_raw SET NOT NULL,
   ALTER COLUMN solution_innovation_raw SET NOT NULL,
   ALTER COLUMN feasibility_raw SET NOT NULL,
-  ALTER COLUMN pitch_storytelling_raw SET NOT NULL,
-  ADD CONSTRAINT pitch_scores_raw_range CHECK (
-    problem_market_raw BETWEEN 0 AND 10 AND
-    solution_innovation_raw BETWEEN 0 AND 10 AND
-    feasibility_raw BETWEEN 0 AND 10 AND
-    pitch_storytelling_raw BETWEEN 0 AND 10
-  );
+  ALTER COLUMN pitch_storytelling_raw SET NOT NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'pitch_scores_raw_range'
+  ) THEN
+    ALTER TABLE public.pitch_scores ADD CONSTRAINT pitch_scores_raw_range CHECK (
+      problem_market_raw BETWEEN 0 AND 10 AND
+      solution_innovation_raw BETWEEN 0 AND 10 AND
+      feasibility_raw BETWEEN 0 AND 10 AND
+      pitch_storytelling_raw BETWEEN 0 AND 10
+    );
+  END IF;
+END $$;
 
 -- The old pre-weighted columns are superseded by *_raw + the weighting
 -- done in pitch_leaderboard. Drop their old CHECK constraints (0-20/0-15)
