@@ -42,10 +42,12 @@ export default function PitchQueuePanel({ eventState, pitches, approvedQuestions
   const [scoreMessage, setScoreMessage] = useState<ToastMessage | null>(null);
   const [actionError, setActionError] = useState<ToastMessage | null>(null);
 
-  const [probMarket, setProbMarket] = useState(15);
-  const [solInnovation, setSolInnovation] = useState(15);
-  const [feasibility, setFeasibility] = useState(11);
-  const [storytelling, setStorytelling] = useState(11);
+  // Judges always enter on a uniform 0-10 scale; category weighting
+  // (x2 / x1.5) is applied server-side in pitch_leaderboard, never here.
+  const [probMarket, setProbMarket] = useState(5);
+  const [solInnovation, setSolInnovation] = useState(5);
+  const [feasibility, setFeasibility] = useState(5);
+  const [storytelling, setStorytelling] = useState(5);
 
   useEffect(() => {
     setQueue(sortQueue(pitches));
@@ -119,9 +121,9 @@ export default function PitchQueuePanel({ eventState, pitches, approvedQuestions
       <CountdownTimer
         initialState={eventState || undefined}
         showControls={true}
-        onStart={async () => { setActionError(null); const r = await startTimerAction(); if (r.error) setActionError({ type: 'error', text: r.error }); onDataChange(); }}
-        onPause={async () => { setActionError(null); const r = await pauseTimerAction(); if (r.error) setActionError({ type: 'error', text: r.error }); onDataChange(); }}
-        onReset={async () => { setActionError(null); const r = await resetTimerAction(); if (r.error) setActionError({ type: 'error', text: r.error }); onDataChange(); }}
+        onStart={async () => { setActionError(null); const r = await startTimerAction(); if (r.error) { setActionError({ type: 'error', text: r.error }); onDataChange(); } }}
+        onPause={async () => { setActionError(null); const r = await pauseTimerAction(); if (r.error) { setActionError({ type: 'error', text: r.error }); onDataChange(); } }}
+        onReset={async () => { setActionError(null); const r = await resetTimerAction(); if (r.error) { setActionError({ type: 'error', text: r.error }); onDataChange(); } }}
         onEnd={handleEndPitch}
       />
 
@@ -165,10 +167,10 @@ export default function PitchQueuePanel({ eventState, pitches, approvedQuestions
               <div className="pt-4 border-t border-panel-border space-y-5">
                 <Toast message={scoreMessage} />
 
-                <ScoreSlider label="1. Problem & Market Insight (20%)" max={20} value={probMarket} onChange={setProbMarket} />
-                <ScoreSlider label="2. Solution & Innovation (20%)" max={20} value={solInnovation} onChange={setSolInnovation} />
-                <ScoreSlider label="3. Feasibility & Business Model (15%)" max={15} value={feasibility} onChange={setFeasibility} />
-                <ScoreSlider label="4. Pitch & Storytelling (15%)" max={15} value={storytelling} onChange={setStorytelling} />
+                <ScoreSlider label="1. Problem & Market Insight (weighted 20%)" max={10} value={probMarket} onChange={setProbMarket} />
+                <ScoreSlider label="2. Solution & Innovation (weighted 20%)" max={10} value={solInnovation} onChange={setSolInnovation} />
+                <ScoreSlider label="3. Feasibility & Business Model (weighted 15%)" max={10} value={feasibility} onChange={setFeasibility} />
+                <ScoreSlider label="4. Pitch & Storytelling (weighted 15%)" max={10} value={storytelling} onChange={setStorytelling} />
 
                 <button
                   onClick={handleSubmitScore}
@@ -219,7 +221,7 @@ export default function PitchQueuePanel({ eventState, pitches, approvedQuestions
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <p className="text-sm font-bold text-text-primary truncate">{p.teams?.team_name || 'Unassigned'}</p>
-                      {i === 0 && !pitchingTeam && (
+                      {i === 0 && (
                         <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-accent-warm/15 text-accent-warm border border-accent-warm/40 shrink-0 uppercase tracking-wider">
                           Next Up
                         </span>

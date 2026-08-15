@@ -8,10 +8,10 @@ import { EventState, TimerStatus } from '@/src/lib/types';
 interface CountdownTimerProps {
   initialState?: EventState | null;
   showControls?: boolean;
-  onStart?: () => void;
-  onPause?: () => void;
-  onReset?: () => void;
-  onEnd?: () => void;
+  onStart?: () => void | Promise<void>;
+  onPause?: () => void | Promise<void>;
+  onReset?: () => void | Promise<void>;
+  onEnd?: () => void | Promise<void>;
 }
 
 export default function CountdownTimer({
@@ -24,10 +24,23 @@ export default function CountdownTimer({
 }: CountdownTimerProps) {
   const [eventState, setEventState] = useState<EventState | null>(initialState || null);
   const [secondsLeft, setSecondsLeft] = useState<number>(0);
+  // Local optimistic override: applied the instant a control is clicked,
+  // before the server round trip resolves. Cleared once a Realtime update
+  // (or the next initialState prop) confirms the server agrees, or after a
+  // timeout so a failed/slow request doesn't leave stale local state
+  // showing forever.
+  const [optimisticStatus, setOptimisticStatus] = useState<TimerStatus | null>(null);
 
   useEffect(() => {
     setEventState(initialState || null);
+    setOptimisticStatus(null);
   }, [initialState]);
+
+  useEffect(() => {
+    if (optimisticStatus === null) return;
+    const t = setTimeout(() => setOptimisticStatus(null), 5000);
+    return () => clearTimeout(t);
+  }, [optimisticStatus]);
 
   // Subscribe to Supabase Realtime on `event_state`
   useEffect(() => {
@@ -51,6 +64,10 @@ export default function CountdownTimer({
         { event: 'UPDATE', schema: 'public', table: 'event_state', filter: 'id=eq.1' },
         (payload: any) => {
           setEventState(payload.new as EventState);
+          // The server has now genuinely confirmed a state (this update
+          // may be our own action's echo, or another client's) — drop the
+          // local override so the real state takes over cleanly.
+          setOptimisticStatus(null);
         }
       )
       .subscribe();
@@ -60,27 +77,37 @@ export default function CountdownTimer({
     };
   }, [initialState]);
 
+  // Optimistic-local start timestamp: set the instant Start is clicked, so
+  // the countdown can begin ticking from Date.now() before the server's
+  // timer_started_at comes back over Realtime.
+  const [optimisticStartedAt, setOptimisticStartedAt] = useState<string | null>(null);
+
+  // Effective values: optimistic override where present, else server state.
+  const effectiveStatus = optimisticStatus ?? eventState?.timer_status;
+  const effectiveStartedAt = optimisticStatus === 'running' ? (optimisticStartedAt ?? eventState?.timer_started_at) : eventState?.timer_started_at;
+
   // Compute countdown ticker. timer_status defaults to 'idle' and only
   // ever becomes 'running' via an explicit Start Timer action elsewhere —
   // this component never starts the timer on its own.
   useEffect(() => {
     if (!eventState) return;
 
-    const { timer_status, timer_started_at, timer_duration_seconds, timer_paused_remaining } = eventState;
+    const { timer_duration_seconds, timer_paused_remaining } = eventState;
+    const status = effectiveStatus;
 
-    if (timer_status === 'idle' || timer_status === 'ended') {
+    if (status === 'idle' || status === 'ended') {
       setSecondsLeft(timer_duration_seconds || 180);
       return;
     }
 
-    if (timer_status === 'paused') {
+    if (status === 'paused') {
       setSecondsLeft(timer_paused_remaining ?? 0);
       return;
     }
 
     const calculateRemaining = () => {
-      if (!timer_started_at) return timer_duration_seconds;
-      const startTime = new Date(timer_started_at).getTime();
+      if (!effectiveStartedAt) return timer_duration_seconds;
+      const startTime = new Date(effectiveStartedAt).getTime();
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       return Math.max(0, timer_duration_seconds - elapsed);
     };
@@ -96,7 +123,7 @@ export default function CountdownTimer({
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [eventState]);
+  }, [eventState, effectiveStatus, effectiveStartedAt]);
 
   const formatTime = (totalSeconds: number) => {
     const mins = Math.floor(totalSeconds / 60);
@@ -117,7 +144,25 @@ export default function CountdownTimer({
     }
   };
 
-  const isLowTime = secondsLeft <= 30 && eventState?.timer_status === 'running';
+  const isLowTime = secondsLeft <= 30 && effectiveStatus === 'running';
+
+  const handleStart = async () => {
+    setOptimisticStartedAt(new Date().toISOString());
+    setOptimisticStatus('running');
+    await onStart?.();
+  };
+  const handlePause = async () => {
+    setOptimisticStatus('paused');
+    await onPause?.();
+  };
+  const handleReset = async () => {
+    setOptimisticStatus('idle');
+    await onReset?.();
+  };
+  const handleEnd = async () => {
+    setOptimisticStatus('ended');
+    await onEnd?.();
+  };
 
   return (
     <div className="card rounded-xl p-4 flex flex-col md:flex-row items-center justify-between gap-4">
@@ -128,7 +173,7 @@ export default function CountdownTimer({
         <div>
           <div className="flex items-center space-x-2">
             <span className="text-xs uppercase tracking-wider text-text-secondary font-mono">Pitch Timer</span>
-            {getStatusBadge(eventState?.timer_status)}
+            {getStatusBadge(effectiveStatus)}
           </div>
           <p className="text-xs text-text-secondary">Synced across Team, Judge, Organiser screens</p>
         </div>
@@ -142,8 +187,8 @@ export default function CountdownTimer({
         {showControls && (
           <div className="flex items-center space-x-1.5 bg-white/5 p-1.5 rounded-lg border border-panel-border">
             <button
-              onClick={onStart}
-              disabled={eventState?.timer_status === 'running'}
+              onClick={handleStart}
+              disabled={effectiveStatus === 'running'}
               className="px-2.5 py-1 text-[11px] font-semibold bg-brand-500/15 text-brand-500 hover:bg-brand-500/25 disabled:opacity-40 rounded transition-colors flex items-center space-x-1"
               title="Start Timer"
             >
@@ -151,22 +196,22 @@ export default function CountdownTimer({
               <span>Start</span>
             </button>
             <button
-              onClick={onPause}
-              disabled={eventState?.timer_status !== 'running'}
+              onClick={handlePause}
+              disabled={effectiveStatus !== 'running'}
               className="px-2 py-1 text-[11px] font-semibold bg-white/5 text-text-secondary hover:bg-white/10 disabled:opacity-40 rounded transition-colors"
               title="Pause Timer"
             >
               <Pause className="w-3.5 h-3.5" />
             </button>
             <button
-              onClick={onReset}
+              onClick={handleReset}
               className="px-2 py-1 text-[11px] font-semibold bg-white/5 text-text-secondary hover:bg-white/10 rounded transition-colors"
               title="Reset Timer"
             >
               <RotateCcw className="w-3.5 h-3.5" />
             </button>
             <button
-              onClick={onEnd}
+              onClick={handleEnd}
               className="px-2.5 py-1 text-[11px] font-semibold bg-accent-live/15 text-accent-live hover:bg-accent-live/25 rounded transition-colors flex items-center space-x-1"
               title="End Pitch"
             >

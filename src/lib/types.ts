@@ -80,13 +80,16 @@ export interface JudgeScore {
 
 // Authoritative, single-row-per-pitch score. Whichever judge or organiser
 // account submits first locks the pitch — no multi-judge averaging.
+// Judges always enter on a uniform 0-10 scale per category; the ×2 / ×1.5
+// category weighting happens server-side (see pitch_leaderboard), never
+// in what judges type.
 export interface PitchScore {
   id: string;
   pitch_id: string;
-  problem_market_score: number; // 0-20
-  solution_innovation_score: number; // 0-20
-  feasibility_score: number; // 0-15
-  pitch_storytelling_score: number; // 0-15
+  problem_market_raw: number; // 0-10
+  solution_innovation_raw: number; // 0-10
+  feasibility_raw: number; // 0-10
+  pitch_storytelling_raw: number; // 0-10
   submitted_by: string | null;
   submitted_by_name: string | null;
   submitted_at: string;
@@ -112,6 +115,13 @@ export interface AudienceScore {
 export type QuestionStatus = 'pending' | 'approved' | 'rejected';
 export type QuestionOutcome = 'team_answered_well' | 'team_answered_poorly' | null;
 
+// Raw per-question point ledger (section 5 rule):
+//   rejected:                    pitching +0, asking +0
+//   approved + answered well:    pitching +2, asking +2
+//   approved + answered poorly:  pitching +0, asking +1
+// Aggregated per-team (across all questions they were pitched at + all
+// questions they asked) and min-max normalized into the 10% Q&A slice —
+// see pitch_leaderboard's qa_component.
 export interface Question {
   id: string;
   asking_team_id: string;
@@ -119,8 +129,8 @@ export interface Question {
   question_text: string;
   status: QuestionStatus;
   outcome: QuestionOutcome;
-  points_to_team: number;
-  points_to_asker: number;
+  points_pitching: number;
+  points_asking: number;
   created_at: string;
   asking_team?: Team;
 }
@@ -135,6 +145,7 @@ export interface EventState {
   timer_duration_seconds: number;
   timer_started_at: string | null;
   timer_paused_remaining: number | null;
+  results_revealed: boolean;
   updated_at: string;
   current_pitch?: Pitch & { team?: Team };
 }
@@ -168,7 +179,7 @@ export interface PitchLeaderboardEntry {
   feasibility_score: number;
   pitch_storytelling_score: number;
   audience_rating_score: number;
-  qa_pressure_score: number;
+  qa_pressure_score: number; // 0-10, already the weighted Q&A component
 
   judges_submitted_count: number;
   submitted_by_name: string | null;

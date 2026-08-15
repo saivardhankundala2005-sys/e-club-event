@@ -14,9 +14,11 @@ interface ManualOverrideModalProps {
 export default function ManualOverrideModal({ entry, onClose }: ManualOverrideModalProps) {
   const [activeTab, setActiveTab] = useState<'override' | 'unlock'>('override');
   const [tableChanged, setTableChanged] = useState<'pitch_scores' | 'audience_scores' | 'questions'>('pitch_scores');
-  const [category, setCategory] = useState<'problem_market_score' | 'solution_innovation_score' | 'feasibility_score' | 'pitch_storytelling_score'>('problem_market_score');
+  const [category, setCategory] = useState<'problem_market_raw' | 'solution_innovation_raw' | 'feasibility_raw' | 'pitch_storytelling_raw'>('problem_market_raw');
   const [rowId, setRowId] = useState('');
   const [newValue, setNewValue] = useState('');
+  const [pointsPitching, setPointsPitching] = useState('0');
+  const [pointsAsking, setPointsAsking] = useState('0');
   const [note, setNote] = useState('');
   const [unlockScoreId, setUnlockScoreId] = useState('');
   const [unlockNote, setUnlockNote] = useState('');
@@ -29,11 +31,18 @@ export default function ManualOverrideModal({ entry, onClose }: ManualOverrideMo
     setLoading(true);
     setMessage(null);
 
+    const newValuePayload =
+      tableChanged === 'pitch_scores'
+        ? { category, score: Number(newValue) }
+        : tableChanged === 'questions'
+          ? { points_pitching: Number(pointsPitching), points_asking: Number(pointsAsking) }
+          : { score: Number(newValue) };
+
     const res = await manualOverrideScoreAction({
       tableChanged,
       rowId,
       oldValue: null,
-      newValue: tableChanged === 'pitch_scores' ? { category, score: Number(newValue) } : { score: Number(newValue) },
+      newValue: newValuePayload,
       note,
     });
 
@@ -133,10 +142,10 @@ export default function ManualOverrideModal({ entry, onClose }: ManualOverrideMo
                   onChange={(e: any) => setCategory(e.target.value)}
                   className="w-full bg-white/5 border border-panel-border rounded-lg px-3 py-2 text-xs text-text-primary focus:outline-none focus:border-brand-500"
                 >
-                  <option value="problem_market_score">Problem & Market (/20)</option>
-                  <option value="solution_innovation_score">Solution & Innovation (/20)</option>
-                  <option value="feasibility_score">Feasibility & Business (/15)</option>
-                  <option value="pitch_storytelling_score">Pitch & Storytelling (/15)</option>
+                  <option value="problem_market_raw">Problem & Market (raw /10, weighted x2)</option>
+                  <option value="solution_innovation_raw">Solution & Innovation (raw /10, weighted x2)</option>
+                  <option value="feasibility_raw">Feasibility & Business (raw /10, weighted x1.5)</option>
+                  <option value="pitch_storytelling_raw">Pitch & Storytelling (raw /10, weighted x1.5)</option>
                 </select>
               </div>
             )}
@@ -153,17 +162,42 @@ export default function ManualOverrideModal({ entry, onClose }: ManualOverrideMo
               />
             </div>
 
-            <div>
-              <label className="block text-xs font-medium text-text-secondary mb-1">New Value</label>
-              <input
-                type="number"
-                required
-                placeholder="New Score / Points"
-                value={newValue}
-                onChange={(e) => setNewValue(e.target.value)}
-                className="w-full bg-white/5 border border-panel-border rounded-lg px-3 py-2 text-xs text-text-primary focus:outline-none focus:border-brand-500"
-              />
-            </div>
+            {tableChanged === 'questions' ? (
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-text-secondary mb-1">Points to Pitching Team</label>
+                  <input
+                    type="number"
+                    required
+                    value={pointsPitching}
+                    onChange={(e) => setPointsPitching(e.target.value)}
+                    className="w-full bg-white/5 border border-panel-border rounded-lg px-3 py-2 text-xs text-text-primary focus:outline-none focus:border-brand-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-text-secondary mb-1">Points to Asking Team</label>
+                  <input
+                    type="number"
+                    required
+                    value={pointsAsking}
+                    onChange={(e) => setPointsAsking(e.target.value)}
+                    className="w-full bg-white/5 border border-panel-border rounded-lg px-3 py-2 text-xs text-text-primary focus:outline-none focus:border-brand-500"
+                  />
+                </div>
+              </div>
+            ) : (
+              <div>
+                <label className="block text-xs font-medium text-text-secondary mb-1">New Value</label>
+                <input
+                  type="number"
+                  required
+                  placeholder={tableChanged === 'pitch_scores' ? 'New raw score (0-10)' : 'New Score'}
+                  value={newValue}
+                  onChange={(e) => setNewValue(e.target.value)}
+                  className="w-full bg-white/5 border border-panel-border rounded-lg px-3 py-2 text-xs text-text-primary focus:outline-none focus:border-brand-500"
+                />
+              </div>
+            )}
 
             <div>
               <label className="block text-xs font-medium text-text-secondary mb-1">Mandatory Audit Note</label>

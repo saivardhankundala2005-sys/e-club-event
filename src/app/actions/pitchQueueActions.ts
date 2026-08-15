@@ -267,6 +267,11 @@ export async function endPitchAction() {
  * attempt for the same pitch is rejected with a clear "already scored"
  * message rather than a raw constraint-violation error.
  */
+/**
+ * Judges always enter scores on a uniform 0-10 scale per category — the
+ * ×2 (20% categories) / ×1.5 (15% categories) weighting happens only in
+ * pitch_leaderboard's SQL, never here or in the UI.
+ */
 export async function submitPitchScoreAction(payload: {
   pitchId: string;
   scores: {
@@ -297,16 +302,16 @@ export async function submitPitchScoreAction(payload: {
   const submittedByName = profile?.full_name || profile?.email || userCtx.user.email;
 
   const { scores } = payload;
-  const clamp = (val: number, max: number) => Math.max(0, Math.min(Number(val) || 0, max));
+  const clamp10 = (val: number) => Math.max(0, Math.min(Number(val) || 0, 10));
 
   const { data: inserted, error: insertErr } = await adminSupabase
     .from('pitch_scores')
     .insert({
       pitch_id: sanitizedPitchId,
-      problem_market_score: clamp(scores.problem_market, 20),
-      solution_innovation_score: clamp(scores.solution_innovation, 20),
-      feasibility_score: clamp(scores.feasibility, 15),
-      pitch_storytelling_score: clamp(scores.pitch_storytelling, 15),
+      problem_market_raw: clamp10(scores.problem_market),
+      solution_innovation_raw: clamp10(scores.solution_innovation),
+      feasibility_raw: clamp10(scores.feasibility),
+      pitch_storytelling_raw: clamp10(scores.pitch_storytelling),
       submitted_by: userCtx.user.id,
       submitted_by_name: submittedByName,
       locked: true,

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { memo, useEffect, useRef } from 'react';
 import { motion, useSpring, useTransform, useInView } from 'framer-motion';
 import { usePrefersReducedMotion } from '@/src/lib/useReducedMotion';
 
@@ -15,7 +15,7 @@ interface AnimatedNumberProps {
  * Counts up/down to `value` instead of snapping, for live-updating scores
  * and vote counts. Renders tabular-nums so digit width never jitters.
  */
-export default function AnimatedNumber({ value, decimals = 0, className = '', suffix = '' }: AnimatedNumberProps) {
+function AnimatedNumber({ value, decimals = 0, className = '', suffix = '' }: AnimatedNumberProps) {
   const reduced = usePrefersReducedMotion();
   const ref = useRef<HTMLSpanElement>(null);
   const inView = useInView(ref, { once: true });
@@ -32,3 +32,5 @@ export default function AnimatedNumber({ value, decimals = 0, className = '', su
     </motion.span>
   );
 }
+
+export default memo(AnimatedNumber);

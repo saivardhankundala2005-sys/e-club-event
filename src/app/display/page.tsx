@@ -12,6 +12,7 @@ import ConnectionStatus, { ConnState } from '@/src/components/ConnectionStatus';
 import PoolBadge from '@/src/components/PoolBadge';
 import QRCode from '@/src/components/QRCode';
 import AnimatedNumber from '@/src/components/AnimatedNumber';
+import PodiumReveal from '@/src/components/PodiumReveal';
 import { usePrefersReducedMotion } from '@/src/lib/useReducedMotion';
 
 const HeroShard = dynamic(() => import('@/src/components/HeroShard'), { ssr: false });
@@ -38,6 +39,7 @@ export default function DisplayPage() {
   const [currentPitch, setCurrentPitch] = useState<(Pitch & { teams?: Team }) | null>(null);
   const [approvedQuestions, setApprovedQuestions] = useState<Question[]>([]);
   const [leaderboard, setLeaderboard] = useState<PitchLeaderboardEntry[]>([]);
+  const [finalLeaderboard, setFinalLeaderboard] = useState<PitchLeaderboardEntry[]>([]);
   const [finalFourRevealed, setFinalFourRevealed] = useState(false);
   const [finalRoundId, setFinalRoundId] = useState<string | null>(null);
   const [connState, setConnState] = useState<ConnState>('connecting');
@@ -93,6 +95,13 @@ export default function DisplayPage() {
           .sort((a, b) => (b.total_weighted_score ?? -1) - (a.total_weighted_score ?? -1))
       );
     }
+
+    // Top-3 reveal ceremony (section 7): if a Final round has actually run
+    // (event_state.current_round_id === the final round, set by
+    // qualifyFinalFourAction), Top 3 must come from the Final round's own
+    // scoring, not the prelim leaderboard — fetch it separately.
+    const { data: flbData } = await supabase.from('pitch_leaderboard').select('*').eq('round_name', 'final');
+    if (flbData) setFinalLeaderboard(flbData as PitchLeaderboardEntry[]);
   }, []);
 
   useEffect(() => {
@@ -165,6 +174,10 @@ export default function DisplayPage() {
 
   const topFour = leaderboard.filter((e) => e.pool === 'A').slice(0, 2).concat(leaderboard.filter((e) => e.pool === 'B').slice(0, 2));
 
+  // Top 3 comes from the Final round's own scoring if one actually ran,
+  // otherwise falls back to the single prelim leaderboard.
+  const podiumSource = finalLeaderboard.length > 0 ? finalLeaderboard : leaderboard;
+
   return (
     <div className="min-h-screen flex flex-col overflow-hidden">
       {/* Minimal chrome: logo + connection status only, visually calmer than the Organiser console */}
@@ -178,7 +191,16 @@ export default function DisplayPage() {
 
       <main className="flex-1 flex flex-col items-center justify-center px-6 sm:px-10 pb-10 space-y-10">
         <AnimatePresence mode="wait">
-          {finalFourRevealed ? (
+          {eventState?.results_revealed ? (
+            <motion.section
+              key="podium-reveal"
+              initial={reducedMotion ? undefined : { opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="w-full max-w-6xl"
+            >
+              <PodiumReveal leaderboard={podiumSource} variant="full" />
+            </motion.section>
+          ) : finalFourRevealed ? (
             <motion.section
               key="final-four"
               initial={reducedMotion ? undefined : { opacity: 0, scale: 0.9 }}
@@ -291,7 +313,7 @@ export default function DisplayPage() {
         {/* Live leaderboard ticker — CSS marquee, no new dependency, paused under reduced-motion.
             Only scored pitches appear here (an unscored pitch has no real
             score to show, not a 0 or a placeholder rank). */}
-        {!finalFourRevealed && leaderboard.some((e) => e.total_weighted_score !== null) && (
+        {!eventState?.results_revealed && !finalFourRevealed && leaderboard.some((e) => e.total_weighted_score !== null) && (
           <div className="w-full max-w-6xl overflow-hidden border-t border-b border-panel-border py-3">
             <div className="flex items-center gap-2 mb-2 text-xs font-semibold text-text-secondary uppercase tracking-wider">
               <Trophy className="w-3.5 h-3.5 text-accent-warm" />

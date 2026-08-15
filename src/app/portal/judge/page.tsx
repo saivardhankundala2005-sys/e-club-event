@@ -3,19 +3,23 @@
 import { useState, useEffect, useCallback } from 'react';
 import Navbar from '@/src/components/Navbar';
 import PitchQueuePanel from '@/src/components/PitchQueuePanel';
+import QuestionQueuePanel from '@/src/components/QuestionQueuePanel';
 import LiveLeaderboard from '@/src/components/LiveLeaderboard';
+import PodiumReveal from '@/src/components/PodiumReveal';
 import ScoredPitchesList from '@/src/components/ScoredPitchesList';
-import { Award, ListChecks, Trophy } from 'lucide-react';
+import { Award, HelpCircle, ListChecks, Trophy } from 'lucide-react';
 import { createClient } from '@/src/lib/supabase/client';
 import { EventState, Pitch, Team, Question, PitchLeaderboardEntry } from '@/src/lib/types';
 
 export default function JudgePortalPage() {
-  const [activeTab, setActiveTab] = useState<'live' | 'scored' | 'leaderboard'>('live');
+  const [activeTab, setActiveTab] = useState<'live' | 'questions' | 'scored' | 'leaderboard'>('live');
 
   const [eventState, setEventState] = useState<EventState | null>(null);
   const [pitches, setPitches] = useState<(Pitch & { teams?: Team })[]>([]);
   const [approvedQuestions, setApprovedQuestions] = useState<Question[]>([]);
+  const [pendingQuestions, setPendingQuestions] = useState<Question[]>([]);
   const [leaderboard, setLeaderboard] = useState<PitchLeaderboardEntry[]>([]);
+  const [podiumLeaderboard, setPodiumLeaderboard] = useState<PitchLeaderboardEntry[]>([]);
   const [loadingData, setLoadingData] = useState(true);
 
   const fetchData = useCallback(async () => {
@@ -41,8 +45,20 @@ export default function JudgePortalPage() {
       setApprovedQuestions([]);
     }
 
+    const { data: pqData } = await supabase
+      .from('questions')
+      .select('*, asking_team:teams(*)')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true });
+    setPendingQuestions((pqData as any) || []);
+
     const { data: lbData } = await supabase.from('pitch_leaderboard').select('*').eq('round_name', 'prelim');
     setLeaderboard((lbData as PitchLeaderboardEntry[]) || []);
+
+    // Podium reveal banner (section 7): Final round's own scoring if one
+    // ran, otherwise falls back to the same prelim data as above.
+    const { data: finalLb } = await supabase.from('pitch_leaderboard').select('*').eq('round_name', 'final');
+    setPodiumLeaderboard(finalLb && finalLb.length > 0 ? (finalLb as PitchLeaderboardEntry[]) : ((lbData as PitchLeaderboardEntry[]) || []));
 
     setLoadingData(false);
   }, []);
@@ -66,6 +82,7 @@ export default function JudgePortalPage() {
 
   const tabs = [
     { key: 'live' as const, label: 'Live / Up Next', icon: Award, active: 'bg-brand-500 text-white shadow-brand-glow' },
+    { key: 'questions' as const, label: 'Question Queue', icon: HelpCircle, active: 'bg-accent-live text-white shadow-live-glow' },
     { key: 'scored' as const, label: 'Scored', icon: ListChecks, active: 'bg-success-500 text-white' },
     { key: 'leaderboard' as const, label: 'Leaderboard', icon: Trophy, active: 'bg-accent-warm text-bg-base shadow-warm-glow' },
   ];
@@ -113,9 +130,22 @@ export default function JudgePortalPage() {
           />
         )}
 
+        {activeTab === 'questions' && (
+          <QuestionQueuePanel pendingQuestions={pendingQuestions} onDataChange={fetchData} />
+        )}
+
         {activeTab === 'scored' && <ScoredPitchesList entries={leaderboard} />}
 
-        {activeTab === 'leaderboard' && <LiveLeaderboard roundName="prelim" />}
+        {activeTab === 'leaderboard' && (
+          <div className="space-y-6">
+            {eventState?.results_revealed && (
+              <div className="card rounded-2xl p-6">
+                <PodiumReveal leaderboard={podiumLeaderboard} variant="compact" />
+              </div>
+            )}
+            <LiveLeaderboard roundName="prelim" />
+          </div>
+        )}
       </main>
     </div>
   );

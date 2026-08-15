@@ -216,7 +216,7 @@ export default function LiveLeaderboard({
                         </div>
                         <div className="bg-white/[0.03] p-2.5 rounded-lg border border-panel-border">
                           <span className="text-text-secondary text-[10px] uppercase tracking-wider block">Q&A Pressure Test (10%)</span>
-                          <span className="font-mono font-bold text-accent-live text-sm">{item.qa_pressure_score.toFixed(1)} / 100 ({item.total_qa_points > 0 ? `+${item.total_qa_points}` : item.total_qa_points} pts)</span>
+                          <span className="font-mono font-bold text-accent-live text-sm">{item.qa_pressure_score.toFixed(1)} / 10 ({item.total_qa_points > 0 ? `+${item.total_qa_points}` : item.total_qa_points} raw pts)</span>
                         </div>
                       </div>
 

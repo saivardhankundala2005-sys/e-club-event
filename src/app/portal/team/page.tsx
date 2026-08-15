@@ -3,19 +3,20 @@
 import { useState, useEffect } from 'react';
 import Navbar from '@/src/components/Navbar';
 import CountdownTimer from '@/src/components/CountdownTimer';
-import LiveLeaderboard from '@/src/components/LiveLeaderboard';
+import PodiumReveal from '@/src/components/PodiumReveal';
 import Toast, { ToastMessage } from '@/src/components/Toast';
 import PoolBadge from '@/src/components/PoolBadge';
-import { Users, Flame, Send, CheckCircle2, ShieldAlert, Trophy, HelpCircle } from 'lucide-react';
+import { Users, Flame, Send, CheckCircle2, ShieldAlert, Trophy, HelpCircle, Lock, ListOrdered } from 'lucide-react';
 import { createClient } from '@/src/lib/supabase/client';
-import { EventState, Pitch, Team, Question } from '@/src/lib/types';
+import { EventState, Pitch, Team, Question, PitchLeaderboardEntry } from '@/src/lib/types';
 import { submitAudienceRatingAction, submitQuestionAction } from '@/src/app/actions/teamActions';
 
 export default function TeamPortalPage() {
   const [myTeam, setMyTeam] = useState<Team | null>(null);
   const [eventState, setEventState] = useState<EventState | null>(null);
   const [currentPitch, setCurrentPitch] = useState<(Pitch & { teams?: Team }) | null>(null);
-  const [nextUpTeam, setNextUpTeam] = useState<Team | null>(null);
+  const [upNextTeams, setUpNextTeams] = useState<Team[]>([]);
+  const [podiumLeaderboard, setPodiumLeaderboard] = useState<PitchLeaderboardEntry[]>([]);
   const [myQuestions, setMyQuestions] = useState<Question[]>([]);
   const [loadingTeam, setLoadingTeam] = useState(true);
 
@@ -63,6 +64,15 @@ export default function TeamPortalPage() {
     // Fetch Event State & Current Pitch
     const { data: es } = await supabase.from('event_state').select('*').eq('id', 1).single();
     setEventState((es as EventState) || null);
+
+    // Podium reveal data: RLS only lets team role read this once
+    // results_revealed = true (see migration), so this is a no-op fetch
+    // pre-reveal — the UI gate below also never renders it before then.
+    if (es?.results_revealed) {
+      const { data: finalLb } = await supabase.from('pitch_leaderboard').select('*').eq('round_name', 'final');
+      const { data: prelimLb } = await supabase.from('pitch_leaderboard').select('*').eq('round_name', 'prelim');
+      setPodiumLeaderboard(finalLb && finalLb.length > 0 ? (finalLb as PitchLeaderboardEntry[]) : ((prelimLb as PitchLeaderboardEntry[]) || []));
+    }
     if (es?.current_pitch_id) {
       const { data: pData } = await supabase
         .from('pitches')
@@ -75,7 +85,9 @@ export default function TeamPortalPage() {
       setCurrentPitch(null);
     }
 
-    // Who's next in the queue, so waiting teams know when to prepare.
+    // Up-next queue (next 3-5 teams), so waiting teams know when to
+    // prepare — read-only, no scores, consistent with the pre-reveal
+    // leaderboard restriction below.
     const { data: queuedPitches } = await supabase
       .from('pitches')
       .select('team_id, pitch_order, queue_position_override, teams(*)')
@@ -88,9 +100,9 @@ export default function TeamPortalPage() {
         const bKey = b.queue_position_override ?? b.pitch_order;
         return aKey - bKey;
       });
-      setNextUpTeam((sorted[0] as any)?.teams || null);
+      setUpNextTeams(sorted.slice(0, 5).map((p: any) => p.teams).filter(Boolean));
     } else {
-      setNextUpTeam(null);
+      setUpNextTeams([]);
     }
 
     setLoadingTeam(false);
@@ -214,21 +226,34 @@ export default function TeamPortalPage() {
           )}
         </div>
 
-        {/* NEXT UP INDICATOR */}
-        {nextUpTeam && (
-          <div className={`card rounded-2xl p-4 flex items-center justify-between gap-3 ${
-            myTeam && nextUpTeam.id === myTeam.id ? 'border-accent-warm/50 bg-accent-warm/10' : ''
-          }`}>
-            <div>
-              <span className="text-[10px] uppercase tracking-wider text-text-secondary font-mono block">Next Up</span>
-              <p className="text-sm font-bold text-text-primary">
-                {nextUpTeam.team_name}
-                {myTeam && nextUpTeam.id === myTeam.id && (
-                  <span className="ml-2 text-accent-warm">— that&apos;s you, get ready!</span>
-                )}
-              </p>
+        {/* LIVE QUEUE: Up Next (read-only, no scores) */}
+        {upNextTeams.length > 0 && (
+          <div className="card rounded-2xl p-4 space-y-2">
+            <div className="flex items-center space-x-2 mb-1">
+              <ListOrdered className="w-4 h-4 text-text-secondary" />
+              <span className="text-[10px] uppercase tracking-wider text-text-secondary font-mono">Up Next</span>
             </div>
-            <PoolBadge pool={nextUpTeam.pool} className="shrink-0" />
+            <div className="space-y-1.5">
+              {upNextTeams.map((team, idx) => (
+                <div
+                  key={team.id}
+                  className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl ${
+                    myTeam && team.id === myTeam.id ? 'border border-accent-warm/50 bg-accent-warm/10' : 'bg-white/[0.02]'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-[10px] font-mono text-text-secondary shrink-0">#{idx + 1}</span>
+                    <p className="text-sm font-bold text-text-primary truncate">
+                      {team.team_name}
+                      {myTeam && team.id === myTeam.id && (
+                        <span className="ml-2 text-accent-warm">— that&apos;s you, get ready!</span>
+                      )}
+                    </p>
+                  </div>
+                  <PoolBadge pool={team.pool} className="shrink-0" />
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
@@ -393,8 +418,23 @@ export default function TeamPortalPage() {
           </div>
         )}
 
-        {/* REALTIME LIVE LEADERBOARD */}
-        <LiveLeaderboard roundName="prelim" />
+        {/* LEADERBOARD: hidden from Team role until the Organiser reveals
+            results (event_state.results_revealed). This is enforced at
+            the RLS level too (pitch_scores/audience_scores SELECT
+            policies) — this UI gate is a courtesy, not the real boundary. */}
+        {eventState?.results_revealed ? (
+          <div className="card rounded-2xl p-6 sm:p-8">
+            <PodiumReveal leaderboard={podiumLeaderboard} variant="compact" />
+          </div>
+        ) : (
+          <div className="card rounded-2xl p-8 text-center space-y-2">
+            <Lock className="w-10 h-10 text-text-secondary/50 mx-auto" />
+            <h3 className="text-base font-bold text-text-primary">Results Not Yet Revealed</h3>
+            <p className="text-xs text-text-secondary max-w-md mx-auto">
+              Rankings and scores stay hidden from teams until the Organiser reveals the results at the end of the event.
+            </p>
+          </div>
+        )}
 
         {/* YOUR TEAM'S JOURNEY SUMMARY */}
         <div className="card rounded-2xl p-6 space-y-4">
@@ -422,7 +462,7 @@ export default function TeamPortalPage() {
                       <p className="text-text-primary line-clamp-2">{q.question_text}</p>
                       <div className="flex items-center justify-between text-[10px] text-text-secondary mt-1">
                         <span>Status: <strong className="text-brand-500 uppercase">{q.status}</strong></span>
-                        {q.points_to_asker > 0 && <span className="text-accent-warm font-bold">+{q.points_to_asker} pts earned</span>}
+                        {q.points_asking > 0 && <span className="text-accent-warm font-bold">+{q.points_asking} pts earned</span>}
                       </div>
                     </div>
                   ))}

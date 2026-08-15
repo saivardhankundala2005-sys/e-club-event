@@ -119,11 +119,27 @@ export async function submitQuestionAction(payload: { pitchId: string; questionT
 
   const { data: team } = await adminSupabase
     .from('teams')
-    .select('id')
+    .select('id, pool')
     .eq('auth_user_id', userCtx.user.id)
     .single();
 
   if (!team) return { error: 'Team profile not found.' };
+
+  // Opposite-pool-only, same as audience rating (section 4's pattern):
+  // a team may only question the opposite pool's live pitch, never its
+  // own pool (including its own pitch).
+  const { data: pitch } = await adminSupabase
+    .from('pitches')
+    .select('id, team_id, teams (id, pool)')
+    .eq('id', sanitizedPitchId)
+    .single();
+
+  if (!pitch || !pitch.teams) return { error: 'Pitch not found.' };
+  const pitchingTeam = pitch.teams as any;
+
+  if (team.id === pitchingTeam.id || team.pool === pitchingTeam.pool) {
+    return { error: 'You can only submit questions for pitches from the opposite pool.' };
+  }
 
   // Double-submit guard: on a double-tap (common on bad event wifi), reject
   // an identical question from the same team for the same pitch submitted

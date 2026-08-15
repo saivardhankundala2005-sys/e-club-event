@@ -48,13 +48,20 @@ export async function exportRegistrationsCsvAction() {
   return { success: true, csv };
 }
 
+// Raw point rule (per question, once approval + outcome are recorded):
+//   rejected:                    pitching +0, asking +0
+//   approved + answered well:    pitching +2, asking +2
+//   approved + answered poorly:  pitching +0, asking +1
+// Stored per-question (not just an incrementing counter) so the math is
+// auditable/re-computable — see pitch_leaderboard's qa_component for the
+// per-team aggregation + min-max normalization into the 10% slice.
 export async function reviewQuestionAction(
   questionId: string,
   status: 'approved' | 'rejected',
   outcome?: 'team_answered_well' | 'team_answered_poorly' | null
 ) {
   try {
-    await requireRole('organiser');
+    await requireRole(['judge', 'organiser']);
   } catch (err: any) {
     return { error: err.message || 'Unauthorized action.' };
   }
@@ -63,19 +70,22 @@ export async function reviewQuestionAction(
   if (!['approved', 'rejected'].includes(status)) {
     return { error: 'Invalid question status.' };
   }
+  if (status === 'approved' && !['team_answered_well', 'team_answered_poorly'].includes(outcome || '')) {
+    return { error: 'An approved question requires an answer-quality outcome.' };
+  }
 
   const adminSupabase = createAdminClient();
 
-  let pointsToTeam = 0;
-  let pointsToAsker = 0;
+  let pointsPitching = 0;
+  let pointsAsking = 0;
 
   if (status === 'approved') {
     if (outcome === 'team_answered_well') {
-      pointsToTeam = 1;
-      pointsToAsker = 0;
+      pointsPitching = 2;
+      pointsAsking = 2;
     } else if (outcome === 'team_answered_poorly') {
-      pointsToTeam = -1;
-      pointsToAsker = 1;
+      pointsPitching = 0;
+      pointsAsking = 1;
     }
   }
 
@@ -83,24 +93,29 @@ export async function reviewQuestionAction(
     .from('questions')
     .update({
       status,
-      outcome: outcome || null,
-      points_to_team: pointsToTeam,
-      points_to_asker: pointsToAsker,
+      outcome: status === 'approved' ? outcome : null,
+      points_pitching: pointsPitching,
+      points_asking: pointsAsking,
     })
     .eq('id', sanitizedQuestionId);
 
   if (error) return { error: error.message };
 
   revalidatePath('/portal/organiser');
+  revalidatePath('/portal/judge');
+  revalidatePath('/portal/team');
   return { success: true };
 }
 
-const PITCH_SCORE_CATEGORY_MAX: Record<string, number> = {
-  problem_market_score: 20,
-  solution_innovation_score: 20,
-  feasibility_score: 15,
-  pitch_storytelling_score: 15,
-};
+// Manual override always writes the raw 0-10 input columns — the same
+// scale judges see — never the pre-weighted value, so the weighting math
+// stays entirely server-side in pitch_leaderboard.
+const PITCH_SCORE_RAW_CATEGORIES = [
+  'problem_market_raw',
+  'solution_innovation_raw',
+  'feasibility_raw',
+  'pitch_storytelling_raw',
+];
 
 export async function manualOverrideScoreAction(payload: {
   tableChanged: 'pitch_scores' | 'audience_scores' | 'questions';
@@ -133,9 +148,8 @@ export async function manualOverrideScoreAction(payload: {
   // 1. Apply modification to target table
   if (tableChanged === 'pitch_scores') {
     const category = String(newValue.category || '');
-    const max = PITCH_SCORE_CATEGORY_MAX[category];
-    if (!max) return { error: 'Invalid pitch score category.' };
-    const numScore = Math.max(0, Math.min(Number(newValue.score) || 0, max));
+    if (!PITCH_SCORE_RAW_CATEGORIES.includes(category)) return { error: 'Invalid pitch score category.' };
+    const numScore = Math.max(0, Math.min(Number(newValue.score) || 0, 10));
     const { error: updateErr } = await adminSupabase
       .from('pitch_scores')
       .update({ [category]: numScore })
@@ -151,8 +165,8 @@ export async function manualOverrideScoreAction(payload: {
     await adminSupabase
       .from('questions')
       .update({
-        points_to_team: Number(newValue.points_to_team) || 0,
-        points_to_asker: Number(newValue.points_to_asker) || 0,
+        points_pitching: Number(newValue.points_pitching) || 0,
+        points_asking: Number(newValue.points_asking) || 0,
       })
       .eq('id', sanitizedRowId);
   }
@@ -309,4 +323,47 @@ export async function qualifyFinalFourAction() {
       score: t.total_weighted_score,
     })),
   };
+}
+
+/**
+ * Organiser-only "Reveal Top 3 & Leaderboard" ceremony trigger. Sets
+ * event_state.results_revealed = true (Team Portal's leaderboard/RLS gate
+ * flips immediately via Realtime) and logs the action to the audit trail.
+ *
+ * Top 3 is computed from the FINAL round if one has run (qualifyFinalFourAction
+ * already switched event_state.current_round_id to it), otherwise from the
+ * single prelim leaderboard — the caller decides which round_name to pass;
+ * this action only flips the reveal flag and audits it.
+ */
+export async function revealTopThreeAction() {
+  let userCtx;
+  try {
+    userCtx = await requireRole('organiser');
+  } catch (err: any) {
+    return { error: err.message || 'Unauthorized action.' };
+  }
+
+  const adminSupabase = createAdminClient();
+
+  const { error } = await adminSupabase
+    .from('event_state')
+    .update({ results_revealed: true, updated_at: new Date().toISOString() })
+    .eq('id', 1);
+
+  if (error) return { error: error.message };
+
+  await adminSupabase.from('score_audit_log').insert({
+    changed_by: userCtx.user.id,
+    table_changed: 'event_state',
+    row_id: '00000000-0000-0000-0000-000000000001',
+    old_value: { results_revealed: false },
+    new_value: { results_revealed: true },
+    note: '[REVEAL] Organiser triggered the Top 3 & Leaderboard reveal ceremony.',
+  });
+
+  revalidatePath('/portal/organiser');
+  revalidatePath('/portal/team');
+  revalidatePath('/portal/judge');
+  revalidatePath('/display');
+  return { success: true };
 }

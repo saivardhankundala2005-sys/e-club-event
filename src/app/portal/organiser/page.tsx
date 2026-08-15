@@ -3,16 +3,18 @@
 import { useState, useEffect, useCallback } from 'react';
 import Navbar from '@/src/components/Navbar';
 import PitchQueuePanel from '@/src/components/PitchQueuePanel';
+import QuestionQueuePanel from '@/src/components/QuestionQueuePanel';
 import LiveLeaderboard from '@/src/components/LiveLeaderboard';
+import PodiumReveal from '@/src/components/PodiumReveal';
 import ManualOverrideModal from '@/src/components/ManualOverrideModal';
 import { triggerConfetti } from '@/src/components/ConfettiEffect';
-import { ShieldAlert, Flame, Users, HelpCircle, Trophy, CheckCircle2, XCircle, Sparkles, FileSpreadsheet } from 'lucide-react';
+import { ShieldAlert, Flame, Users, HelpCircle, Trophy, Sparkles, FileSpreadsheet, PartyPopper } from 'lucide-react';
 import { createClient } from '@/src/lib/supabase/client';
 import { EventState, Pitch, Team, Question, PitchLeaderboardEntry, ScoreAuditLog } from '@/src/lib/types';
 import {
-  reviewQuestionAction,
   qualifyFinalFourAction,
   exportRegistrationsCsvAction,
+  revealTopThreeAction,
 } from '@/src/app/actions/organiserActions';
 
 export default function OrganiserPortalPage() {
@@ -25,6 +27,7 @@ export default function OrganiserPortalPage() {
   const [pendingQuestions, setPendingQuestions] = useState<Question[]>([]);
   const [auditLogs, setAuditLogs] = useState<ScoreAuditLog[]>([]);
   const [approvedQuestions, setApprovedQuestions] = useState<Question[]>([]);
+  const [leaderboard, setLeaderboard] = useState<PitchLeaderboardEntry[]>([]);
   const [loadingData, setLoadingData] = useState(true);
 
   const [selectedOverrideEntry, setSelectedOverrideEntry] = useState<PitchLeaderboardEntry | null>(null);
@@ -73,6 +76,16 @@ export default function OrganiserPortalPage() {
       .order('timestamp', { ascending: false });
     setAuditLogs((auditData as ScoreAuditLog[]) || []);
 
+    // For the podium reveal banner: Final round's own scoring if one ran,
+    // otherwise the prelim leaderboard (section 7's round-structure rule).
+    const { data: finalLb } = await supabase.from('pitch_leaderboard').select('*').eq('round_name', 'final');
+    if (finalLb && finalLb.length > 0) {
+      setLeaderboard(finalLb as PitchLeaderboardEntry[]);
+    } else {
+      const { data: prelimLb } = await supabase.from('pitch_leaderboard').select('*').eq('round_name', 'prelim');
+      setLeaderboard((prelimLb as PitchLeaderboardEntry[]) || []);
+    }
+
     setLoadingData(false);
   }, []);
 
@@ -95,15 +108,6 @@ export default function OrganiserPortalPage() {
     };
   }, [fetchOrganiserData]);
 
-  const handleQuestionReview = async (
-    questionId: string,
-    status: 'approved' | 'rejected',
-    outcome?: 'team_answered_well' | 'team_answered_poorly' | null
-  ) => {
-    await reviewQuestionAction(questionId, status, outcome);
-    fetchOrganiserData();
-  };
-
   const handleQualifyFinalFour = async () => {
     setLoadingAction(true);
     setQualifySuccessMsg(null);
@@ -115,6 +119,18 @@ export default function OrganiserPortalPage() {
       triggerConfetti();
       setQualifySuccessMsg('Top 2 Pool A & Top 2 Pool B Qualified for Final 4!');
       fetchOrganiserData();
+    }
+  };
+
+  const handleRevealTopThree = async () => {
+    if (!confirm('Reveal the Top 3 & full leaderboard to everyone now? This cannot be undone during the event.')) return;
+    setLoadingAction(true);
+    const res = await revealTopThreeAction();
+    setLoadingAction(false);
+    if (res.success) {
+      fetchOrganiserData();
+    } else if (res.error) {
+      alert(res.error);
     }
   };
 
@@ -188,7 +204,7 @@ export default function OrganiserPortalPage() {
             can never drift out of sync between the two roles. */}
         {activeTab === 'control' && (
           <div className="space-y-8">
-            <div className="flex items-center justify-end">
+            <div className="flex items-center justify-end gap-3">
               <button
                 onClick={handleQualifyFinalFour}
                 disabled={loadingAction}
@@ -196,6 +212,18 @@ export default function OrganiserPortalPage() {
               >
                 <Sparkles className="w-4 h-4" />
                 <span>Reveal Final 4 & Qualify</span>
+              </button>
+
+              {/* Organiser-only, single end-of-event moment: flips
+                  results_revealed and broadcasts the podium ceremony to
+                  Team/Judge/Organiser/Display via Realtime. */}
+              <button
+                onClick={handleRevealTopThree}
+                disabled={loadingAction || eventState?.results_revealed}
+                className="px-4 py-2.5 rounded-xl font-bold text-xs bg-gradient-to-r from-brand-500 via-purple-500 to-accent-live text-white shadow-brand-glow hover:scale-105 transition-all flex items-center space-x-2 disabled:opacity-50 disabled:hover:scale-100"
+              >
+                <PartyPopper className="w-4 h-4" />
+                <span>{eventState?.results_revealed ? 'Results Revealed' : 'Reveal Top 3 & Leaderboard'}</span>
               </button>
             </div>
 
@@ -214,78 +242,26 @@ export default function OrganiserPortalPage() {
           </div>
         )}
 
-        {/* TAB 2: QUESTION QUEUE */}
+        {/* TAB 2: QUESTION QUEUE — shared with Judge portal, see
+            QuestionQueuePanel */}
         {activeTab === 'questions' && (
-          <div className="card rounded-2xl p-6 space-y-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-xl font-bold text-text-primary flex items-center space-x-2">
-                  <HelpCircle className="w-5 h-5 text-accent-live" />
-                  <span>Incoming Question Queue</span>
-                </h2>
-                <p className="text-xs text-text-secondary">Review rival team questions and score their Q&A performance.</p>
-              </div>
-              <span className="text-xs font-mono font-bold text-accent-live">{pendingQuestions.length} Pending</span>
-            </div>
-
-            {pendingQuestions.length === 0 ? (
-              <div className="text-center py-10 space-y-2">
-                <CheckCircle2 className="w-10 h-10 text-success-500 mx-auto" />
-                <h4 className="font-bold text-text-primary">Question Queue Clear</h4>
-                <p className="text-xs text-text-secondary">Incoming questions submitted by teams will appear here in real-time.</p>
-              </div>
-            ) : (
-              <div className="space-y-4">
-                {pendingQuestions.map((q) => (
-                  <div key={q.id} className="p-4 rounded-xl bg-white/[0.03] border border-panel-border space-y-3">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-text-secondary">Asked by: <strong className="text-brand-500 font-bold">{q.asking_team?.team_name}</strong></span>
-                      <span className="text-text-secondary/70 font-mono">{new Date(q.created_at).toLocaleTimeString()}</span>
-                    </div>
-
-                    <p className="text-sm text-text-primary font-medium bg-black/20 p-3 rounded-lg border border-panel-border">
-                      &ldquo;{q.question_text}&rdquo;
-                    </p>
-
-                    <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
-                      <button
-                        onClick={() => handleQuestionReview(q.id, 'rejected')}
-                        className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white/5 hover:bg-danger-500/15 text-text-secondary hover:text-danger-500 border border-panel-border transition-colors flex items-center space-x-1"
-                      >
-                        <XCircle className="w-3.5 h-3.5" />
-                        <span>Reject</span>
-                      </button>
-
-                      <button
-                        onClick={() => handleQuestionReview(q.id, 'approved', 'team_answered_well')}
-                        className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-success-500/15 hover:bg-success-500/25 text-success-500 border border-success-500/40 transition-colors flex items-center space-x-1"
-                      >
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span>Approve & Team Answered Well (+1 Team / 0 Asker)</span>
-                      </button>
-
-                      <button
-                        onClick={() => handleQuestionReview(q.id, 'approved', 'team_answered_poorly')}
-                        className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-live/15 hover:bg-accent-live/25 text-accent-live border border-accent-live/40 transition-colors flex items-center space-x-1"
-                      >
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span>Approve & Poor Answer (+1 Asker / -1 Team)</span>
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
+          <QuestionQueuePanel pendingQuestions={pendingQuestions} onDataChange={fetchOrganiserData} />
         )}
 
         {/* TAB 3: LIVE LEADERBOARD & MANUAL OVERRIDES */}
         {activeTab === 'leaderboard' && (
-          <LiveLeaderboard
-            roundName="prelim"
-            showOverrideButton={true}
-            onOverrideClick={(entry) => setSelectedOverrideEntry(entry)}
-          />
+          <div className="space-y-6">
+            {eventState?.results_revealed && (
+              <div className="card rounded-2xl p-6">
+                <PodiumReveal leaderboard={leaderboard} variant="compact" />
+              </div>
+            )}
+            <LiveLeaderboard
+              roundName="prelim"
+              showOverrideButton={true}
+              onOverrideClick={(entry) => setSelectedOverrideEntry(entry)}
+            />
+          </div>
         )}
 
         {/* TAB 4: TEAM REGISTRATIONS TABLE */}

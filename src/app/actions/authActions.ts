@@ -5,18 +5,59 @@ import { createAdminClient } from '@/src/lib/supabase/admin';
 import { isValidStaffEmail, isValidEmailFormat, validateTeamMemberEmails } from '@/src/lib/validation';
 import { redirect } from 'next/navigation';
 
+const OTP_REQUEST_COOLDOWN_SECONDS = 15;
+
 export async function requestTeamOtpAction(formData: FormData) {
   const email = formData.get('email') as string;
 
   if (!email || !isValidEmailFormat(email)) {
     return { error: 'Please provide a valid email address.' };
   }
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const adminSupabase = createAdminClient();
+
+  // Idempotency / rate-limit: if this email requested a code in the last
+  // OTP_REQUEST_COOLDOWN_SECONDS, don't send a second one — acknowledge
+  // success instead. Covers both a genuine double-tap/flaky-retry and
+  // repeated-tap abuse, without a DB round trip that can race (the
+  // UNIQUE PK on email + upsert-with-condition below is the atomic guard).
+  const { data: existingLog } = await adminSupabase
+    .from('otp_request_log')
+    .select('last_requested_at')
+    .eq('email', normalizedEmail)
+    .maybeSingle();
+
+  if (existingLog) {
+    const elapsedMs = Date.now() - new Date(existingLog.last_requested_at).getTime();
+    if (elapsedMs < OTP_REQUEST_COOLDOWN_SECONDS * 1000) {
+      return { success: true, email: normalizedEmail };
+    }
+  }
+
+  // Re-login vs. registration: one email input serves both. If a team
+  // already exists for this email, send a login-only OTP that does not
+  // create a new auth user (shouldCreateUser: false), so a repeat visitor
+  // authenticates without re-running domain/pool assignment. Otherwise
+  // fall through to the existing registration OTP (creates the user).
+  // profiles.email is unique and populated for every verified team auth
+  // user (see verifyTeamOtpAction's upsert), so it's a direct lookup —
+  // no need to page through auth.admin.listUsers().
+  const { data: existingProfile } = await adminSupabase
+    .from('profiles')
+    .select('id')
+    .eq('email', normalizedEmail)
+    .maybeSingle();
+
+  const { data: existingTeam } = existingProfile
+    ? await adminSupabase.from('teams').select('id').eq('auth_user_id', existingProfile.id).maybeSingle()
+    : { data: null };
 
   const supabase = createClient();
   const { error } = await supabase.auth.signInWithOtp({
-    email,
+    email: normalizedEmail,
     options: {
-      shouldCreateUser: true,
+      shouldCreateUser: !existingTeam,
     },
   });
 
@@ -24,7 +65,16 @@ export async function requestTeamOtpAction(formData: FormData) {
     return { error: error.message };
   }
 
-  return { success: true, email };
+  await adminSupabase
+    .from('otp_request_log')
+    .upsert({ email: normalizedEmail, last_requested_at: new Date().toISOString() });
+
+  // Deliberately does NOT return whether this was a new-vs-returning team —
+  // that would let an unauthenticated caller enumerate registered emails
+  // via this response alone (routing on new-vs-returning only happens
+  // post-verification, in verifyTeamOtpAction, once inbox ownership is
+  // proven — see isReturningTeam there instead).
+  return { success: true, email: normalizedEmail };
 }
 
 export async function verifyTeamOtpAction(email: string, token: string) {
@@ -40,21 +90,38 @@ export async function verifyTeamOtpAction(email: string, token: string) {
   });
 
   if (error) {
-    return { error: error.message };
+    const isExpired = /expired/i.test(error.message);
+    return {
+      error: isExpired
+        ? 'This code has expired. Request a new one below.'
+        : 'Incorrect code. Please check and try again.',
+      expired: isExpired,
+    };
   }
 
-  if (data.user) {
-    // Ensure profile row exists
-    const adminSupabase = createAdminClient();
-    await adminSupabase.from('profiles').upsert({
-      id: data.user.id,
-      email: data.user.email!,
-      role: 'team',
-      full_name: email.split('@')[0],
-    });
+  if (!data.user) {
+    return { error: 'Verification failed. Please try again.' };
   }
 
-  return { success: true };
+  const adminSupabase = createAdminClient();
+
+  // Ensure profile row exists (both new registrants and returning teams).
+  await adminSupabase.from('profiles').upsert({
+    id: data.user.id,
+    email: data.user.email!,
+    role: 'team',
+    full_name: email.split('@')[0],
+  });
+
+  // Returning team: route straight to their existing dashboard, skip
+  // registration/domain/pool assignment entirely.
+  const { data: existingTeam } = await adminSupabase
+    .from('teams')
+    .select('id')
+    .eq('auth_user_id', data.user.id)
+    .maybeSingle();
+
+  return { success: true, isReturningTeam: !!existingTeam };
 }
 
 export async function registerTeamAction(payload: {
@@ -105,27 +172,28 @@ export async function registerTeamAction(payload: {
     return { error: `You have already registered a team ("${existingTeam.team_name}"). Each account may register only one team.` };
   }
 
-  // 4. Random Domain Selection from `domains` table
-  const { data: domains, error: domainErr } = await adminSupabase.from('domains').select('name');
-  if (domainErr || !domains || domains.length === 0) {
-    return { error: 'Failed to fetch domains from database.' };
+  // 4. Least-assigned-first domain selection: pick uniformly at random
+  // among whichever domain(s) currently have the lowest assigned_count,
+  // rather than pure Math.random() across the whole table (which produces
+  // back-to-back repeats). The "find min, increment, return" happens
+  // atomically in assign_least_used_domain (a single RPC round trip), so
+  // two concurrent registrations can't both read the same lowest count and
+  // pick the same domain without seeing each other's increment.
+  const { data: domainResult, error: domainErr } = await adminSupabase.rpc('assign_least_used_domain');
+  if (domainErr || !domainResult) {
+    return { error: 'Failed to assign a domain.' };
   }
-  const randomDomain = domains[Math.floor(Math.random() * domains.length)].name;
+  const assignedDomain = domainResult as string;
 
-  // 5. Auto-Balanced Pool Assignment (A or B)
-  const { data: poolACount } = await adminSupabase
-    .from('teams')
-    .select('id', { count: 'exact' })
-    .eq('pool', 'A');
-  
-  const { data: poolBCount } = await adminSupabase
-    .from('teams')
-    .select('id', { count: 'exact' })
-    .eq('pool', 'B');
-
-  const countA = poolACount?.length || 0;
-  const countB = poolBCount?.length || 0;
-  const assignedPool: 'A' | 'B' = countA <= countB ? 'A' : 'B';
+  // 5. Deterministic pool alternation via a Postgres sequence: nextval()
+  // is a single atomic operation, so two simultaneous registrations can
+  // never both land in the same slot (unlike the previous
+  // countA <= countB read-then-write check, which had a race window).
+  const { data: seqResult, error: seqErr } = await adminSupabase.rpc('next_pool_assignment');
+  if (seqErr || !seqResult) {
+    return { error: 'Failed to assign a pool.' };
+  }
+  const assignedPool = seqResult as 'A' | 'B';
 
   // 6. Insert Team
   const { data: team, error: teamErr } = await adminSupabase
@@ -133,7 +201,7 @@ export async function registerTeamAction(payload: {
     .insert({
       auth_user_id: user.id,
       team_name: teamName,
-      domain: randomDomain,
+      domain: assignedDomain,
       pool: assignedPool,
       status: 'registered',
     })
@@ -179,7 +247,7 @@ export async function registerTeamAction(payload: {
   return {
     success: true,
     team,
-    domain: randomDomain,
+    domain: assignedDomain,
     pool: assignedPool,
   };
 }
