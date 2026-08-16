@@ -70,33 +70,44 @@ async function main() {
   console.log(`STAFF_TEST_EMAIL_ALLOWLIST currently contains ${testAllowlist.length} entries (must be emptied before the real event): ${testAllowlist.join(', ') || '(empty)'}`);
   step('A random gmail NOT on the allowlist is still rejected', !isValidStaffEmail('totally-random-address@gmail.com') && !testAllowlist.includes('totally-random-address@gmail.com'));
 
-  console.log('\n=== Pool assignment variety across registrations ===');
+  console.log('\n=== Pool assignment variety across registrations (real RPCs) ===');
   const { data: domains } = await admin.from('domains').select('name');
   step('Multiple domains exist for auto-assignment variety', domains.length > 1, `domains=${domains.map((d) => d.name).join(', ')}`);
 
+  // Exercises the ACTUAL next_pool_assignment / assign_least_used_domain
+  // RPCs (section 12/11), not a reimplementation — this is the real
+  // atomic-sequence and least-assigned-first logic registerTeamAction uses.
   const registeredPools = [];
-  const registeredDomains = new Set();
-  for (let i = 0; i < 4; i++) {
+  const registeredDomains = [];
+  for (let i = 0; i < 6; i++) {
     const email = `poolreg-${i}-${RUN_ID}@example.com`;
     const { data: u } = await admin.auth.admin.createUser({ email, email_confirm: true });
     created.authUsers.push(u.user.id);
     await admin.from('profiles').upsert({ id: u.user.id, email, role: 'team', full_name: `Pool Reg ${i}` });
 
-    const { data: poolACount } = await admin.from('teams').select('id', { count: 'exact' }).eq('pool', 'A');
-    const { data: poolBCount } = await admin.from('teams').select('id', { count: 'exact' }).eq('pool', 'B');
-    const assignedPool = (poolACount?.length || 0) <= (poolBCount?.length || 0) ? 'A' : 'B';
-    const randomDomain = domains[Math.floor(Math.random() * domains.length)].name;
+    const { data: assignedPool, error: poolErr } = await admin.rpc('next_pool_assignment');
+    const { data: assignedDomain, error: domainErr } = await admin.rpc('assign_least_used_domain');
+    if (poolErr || domainErr) throw new Error(`RPC failed: ${poolErr?.message || domainErr?.message}`);
 
     const { data: team } = await admin.from('teams').insert({
-      auth_user_id: u.user.id, team_name: `POOLREG-${i}-${RUN_ID}`, domain: randomDomain, pool: assignedPool, status: 'registered',
+      auth_user_id: u.user.id, team_name: `POOLREG-${i}-${RUN_ID}`, domain: assignedDomain, pool: assignedPool, status: 'registered',
     }).select().single();
     created.teamIds.push(team.id);
     registeredPools.push(assignedPool);
-    registeredDomains.add(randomDomain);
+    registeredDomains.push(assignedDomain);
   }
+  // next_pool_assignment strictly alternates via a shared sequence, so
+  // consecutive calls (even across concurrent registrations elsewhere)
+  // must never repeat the same pool twice in a row within this run's
+  // own sequential calls.
+  let noConsecutiveRepeat = true;
+  for (let i = 1; i < registeredPools.length; i++) {
+    if (registeredPools[i] === registeredPools[i - 1]) noConsecutiveRepeat = false;
+  }
+  step('next_pool_assignment strictly alternates (no consecutive repeat across 6 calls)', noConsecutiveRepeat, `pools=${registeredPools.join(',')}`);
   const hasBothPools = registeredPools.includes('A') && registeredPools.includes('B');
-  step('4 sequential registrations produce balanced pool assignment (not all same pool)', hasBothPools, `pools=${registeredPools.join(',')}`);
-  console.log(`Domains actually assigned across the 4 test registrations: ${[...registeredDomains].join(', ')} (random selection, may coincidentally repeat)`);
+  step('6 sequential registrations produce both pools', hasBothPools, `pools=${registeredPools.join(',')}`);
+  console.log(`Domains actually assigned across the 6 test registrations (least-assigned-first): ${registeredDomains.join(', ')}`);
 
   console.log('\n=== CSV export role gating ===');
   const orgEmail = `csv-org-${RUN_ID}@student.nitw.ac.in`;
@@ -130,62 +141,83 @@ async function main() {
   step('CSV export DENIED for team', !!teamResult.error, teamResult.error);
   step('CSV export DENIED for logged-out (no user context)', true, 'getAuthenticatedUser() returns null when supabase.auth.getUser() has no session -> requireRole throws Unauthorized');
 
-  console.log('\n=== setLivePitchAction: event_state / pitches reflect change ===');
+  console.log('\n=== Call-to-stage: event_state / pitches.queue_status reflect change ===');
+  // There is no separate setLivePitchAction in the current codebase — the
+  // Judge/Organiser queue flow is callToStageAction (pitchQueueActions.ts).
+  // trg_create_prelim_pitch_for_team already created this team's pitch row;
+  // mirror callToStageAction's exact DB effect (queue_status + event_state).
   const { data: prelimRound } = await admin.from('rounds').select('id').eq('name', 'prelim').single();
   const { data: liveTestTeam } = await admin.from('teams').insert({
     auth_user_id: null, team_name: `LIVETEST-${RUN_ID}`, domain: domains[0].name, pool: 'A', status: 'registered',
   }).select().single();
   created.teamIds.push(liveTestTeam.id);
-  const { data: liveTestPitch } = await admin.from('pitches').insert({
-    team_id: liveTestTeam.id, round_id: prelimRound.id, status: 'upcoming', pitch_order: 950,
-  }).select().single();
+  const { data: liveTestPitch } = await admin.from('pitches').select('*').eq('team_id', liveTestTeam.id).eq('round_id', prelimRound.id).single();
   created.pitchIds.push(liveTestPitch.id);
 
-  // Mirror setLivePitchAction logic exactly
-  await admin.from('pitches').update({ status: 'live', started_at: new Date().toISOString() }).eq('id', liveTestPitch.id);
-  await admin.from('event_state').update({ current_pitch_id: liveTestPitch.id, updated_at: new Date().toISOString() }).eq('id', 1);
+  // Save & restore whatever event_state currently points at, so this test
+  // doesn't clobber real event state if run against a live project mid-event.
+  const { data: eventStateBefore } = await admin.from('event_state').select('current_pitch_id').eq('id', 1).single();
 
-  const { data: pitchAfter } = await admin.from('pitches').select('status').eq('id', liveTestPitch.id).single();
-  const { data: eventStateAfter } = await admin.from('event_state').select('current_pitch_id').eq('id', 1).single();
-  step('pitches.status becomes "live" after setLivePitchAction', pitchAfter.status === 'live');
-  step('event_state.current_pitch_id reflects the new live pitch', eventStateAfter.current_pitch_id === liveTestPitch.id);
+  // Mirror callToStageAction's exact DB effect
+  await admin.from('pitches').update({ queue_status: 'called' }).eq('id', liveTestPitch.id);
+  await admin.from('event_state').update({
+    current_pitch_id: liveTestPitch.id,
+    timer_status: 'idle',
+    timer_started_at: null,
+    timer_paused_remaining: null,
+    updated_at: new Date().toISOString(),
+  }).eq('id', 1);
 
-  // Reset event_state back to null so we don't leave the live app pointing at test data
-  await admin.from('event_state').update({ current_pitch_id: null, updated_at: new Date().toISOString() }).eq('id', 1);
-  await admin.from('pitches').update({ status: 'done', ended_at: new Date().toISOString() }).eq('id', liveTestPitch.id);
+  const { data: pitchAfter } = await admin.from('pitches').select('queue_status').eq('id', liveTestPitch.id).single();
+  const { data: eventStateAfter } = await admin.from('event_state').select('current_pitch_id, timer_status').eq('id', 1).single();
+  step('pitches.queue_status becomes "called" after call-to-stage', pitchAfter.queue_status === 'called');
+  step('event_state.current_pitch_id reflects the newly-called pitch', eventStateAfter.current_pitch_id === liveTestPitch.id);
+  step('event_state.timer_status resets to idle on call-to-stage', eventStateAfter.timer_status === 'idle');
 
-  console.log('\n=== Question queue outcomes & point math ===');
+  // Restore event_state to what it was before this test ran.
+  await admin.from('event_state').update({ current_pitch_id: eventStateBefore.current_pitch_id, updated_at: new Date().toISOString() }).eq('id', 1);
+  await admin.from('pitches').update({ queue_status: 'scored' }).eq('id', liveTestPitch.id);
+
+  console.log('\n=== Question queue outcomes & point math (section 5 rule) ===');
   const teamAskEmail = `qq-team-${RUN_ID}@example.com`;
   const { data: qqTeamUser } = await admin.auth.admin.createUser({ email: teamAskEmail, email_confirm: true });
   created.authUsers.push(qqTeamUser.user.id);
   await admin.from('profiles').upsert({ id: qqTeamUser.user.id, email: teamAskEmail, role: 'team', full_name: 'QQ Team' });
   const { data: qqTeam } = await admin.from('teams').insert({ auth_user_id: qqTeamUser.user.id, team_name: `QQ-${RUN_ID}`, domain: domains[0].name, pool: 'A', status: 'registered' }).select().single();
   created.teamIds.push(qqTeam.id);
-  const { data: qqPitch } = await admin.from('pitches').insert({ team_id: qqTeam.id, round_id: prelimRound.id, status: 'live', pitch_order: 951 }).select().single();
+  // trg_create_prelim_pitch_for_team already created qqTeam's pitch.
+  const { data: qqPitch } = await admin.from('pitches').select('*').eq('team_id', qqTeam.id).eq('round_id', prelimRound.id).single();
   created.pitchIds.push(qqPitch.id);
 
-  // "answered well" -> points_to_team +1, points_to_asker 0
+  // "answered well" -> pitching +2, asking +2 (section 5 rule)
   const { data: qWell } = await admin.from('questions').insert({ asking_team_id: qqTeam.id, pitch_id: qqPitch.id, question_text: 'well-answered test', status: 'pending' }).select().single();
-  await admin.from('questions').update({ status: 'approved', outcome: 'team_answered_well', points_to_team: 1, points_to_asker: 0 }).eq('id', qWell.id);
+  await admin.from('questions').update({ status: 'approved', outcome: 'team_answered_well', points_pitching: 2, points_asking: 2 }).eq('id', qWell.id);
   const { data: qWellAfter } = await admin.from('questions').select('*').eq('id', qWell.id).single();
-  step('Approved "answered well": points_to_team=+1, points_to_asker=0', qWellAfter.points_to_team === 1 && qWellAfter.points_to_asker === 0 && qWellAfter.status === 'approved');
+  step('Approved "answered well": points_pitching=+2, points_asking=+2', qWellAfter.points_pitching === 2 && qWellAfter.points_asking === 2 && qWellAfter.status === 'approved');
 
-  // "answered poorly" -> points_to_team -1, points_to_asker +1
+  // "answered poorly" -> pitching +0, asking +1 (section 5 rule)
   const { data: qPoor } = await admin.from('questions').insert({ asking_team_id: qqTeam.id, pitch_id: qqPitch.id, question_text: 'poorly-answered test', status: 'pending' }).select().single();
-  await admin.from('questions').update({ status: 'approved', outcome: 'team_answered_poorly', points_to_team: -1, points_to_asker: 1 }).eq('id', qPoor.id);
+  await admin.from('questions').update({ status: 'approved', outcome: 'team_answered_poorly', points_pitching: 0, points_asking: 1 }).eq('id', qPoor.id);
   const { data: qPoorAfter } = await admin.from('questions').select('*').eq('id', qPoor.id).single();
-  step('Approved "answered poorly": points_to_team=-1, points_to_asker=+1', qPoorAfter.points_to_team === -1 && qPoorAfter.points_to_asker === 1);
+  step('Approved "answered poorly": points_pitching=0, points_asking=+1', qPoorAfter.points_pitching === 0 && qPoorAfter.points_asking === 1);
 
   // Reject -> no score effect, marked rejected not deleted
   const { data: qRej } = await admin.from('questions').insert({ asking_team_id: qqTeam.id, pitch_id: qqPitch.id, question_text: 'rejected test', status: 'pending' }).select().single();
-  await admin.from('questions').update({ status: 'rejected', outcome: null, points_to_team: 0, points_to_asker: 0 }).eq('id', qRej.id);
+  await admin.from('questions').update({ status: 'rejected', outcome: null, points_pitching: 0, points_asking: 0 }).eq('id', qRej.id);
   const { data: qRejAfter } = await admin.from('questions').select('*').eq('id', qRej.id).single();
-  step('Rejected question: status=rejected, no points, row still exists (not deleted)', !!qRejAfter && qRejAfter.status === 'rejected' && qRejAfter.points_to_team === 0);
+  step('Rejected question: status=rejected, no points, row still exists (not deleted)', !!qRejAfter && qRejAfter.status === 'rejected' && qRejAfter.points_pitching === 0 && qRejAfter.points_asking === 0);
 
-  // Leaderboard reflects the net qa points (qWell +1, qPoor -1 => net 0 -> qa_pressure_score = 50 + 0*10 = 50)
+  // qqTeam is BOTH the pitching team (qWell/qPoor were asked at its own
+  // pitch) and the asking team (it asked its own questions here, purely
+  // for point-math isolation — cross-pool RLS is covered separately above).
+  // raw_qa_points for qqTeam = pitching(2+0) + asking(2+1) = 5.
   await new Promise((r) => setTimeout(r, 600));
   const { data: qqLbRow } = await admin.from('pitch_leaderboard').select('qa_pressure_score, total_qa_points').eq('pitch_id', qqPitch.id).single();
-  step('Leaderboard qa_pressure_score reflects net approved question points (well +1, poor -1 => net 0 => base 50)', qqLbRow.total_qa_points === 0 && Number(qqLbRow.qa_pressure_score) === 50, `total_qa_points=${qqLbRow.total_qa_points} qa_pressure_score=${qqLbRow.qa_pressure_score}`);
+  step(
+    'Leaderboard total_qa_points reflects the sum of this team\'s pitching + asking raw points (2+0+2+1=5)',
+    qqLbRow.total_qa_points === 5,
+    `total_qa_points=${qqLbRow.total_qa_points} qa_pressure_score=${qqLbRow.qa_pressure_score}`
+  );
 
   console.log('\n=== Manual override: note requirement + audit trail ===');
   const overrideOrgEmail = `override-org-${RUN_ID}@student.nitw.ac.in`;
@@ -203,55 +235,63 @@ async function main() {
   step('manualOverrideScoreAction rejects too-short note', !!validateOverrideNote('ok').error);
   step('manualOverrideScoreAction accepts valid note', validateOverrideNote('Corrected transposed digits from judge scoresheet').success);
 
-  // With a note: perform the actual override + audit insert (mirrors manualOverrideScoreAction body)
-  const overrideJudgeEmail = `override-judge-${RUN_ID}@student.nitw.ac.in`;
-  const { data: overrideJudgeUser } = await admin.auth.admin.createUser({ email: overrideJudgeEmail, email_confirm: true });
-  created.authUsers.push(overrideJudgeUser.user.id);
-  await admin.from('profiles').upsert({ id: overrideJudgeUser.user.id, email: overrideJudgeEmail, role: 'judge', full_name: 'Override Judge' });
-  const { data: overrideJudge } = await admin.from('judges').insert({ auth_user_id: overrideJudgeUser.user.id, name: 'Override Judge', email: overrideJudgeEmail }).select().single();
-  created.judgeIds.push(overrideJudge.id);
+  // With a note: perform the actual override + audit insert (mirrors
+  // manualOverrideScoreAction body against pitch_scores' raw columns).
+  const { data: overrideScoreRow } = await admin.from('pitch_scores').insert({
+    pitch_id: qqPitch.id,
+    problem_market_raw: 6,
+    solution_innovation_raw: 6,
+    feasibility_raw: 6,
+    pitch_storytelling_raw: 6,
+    submitted_by_name: 'Override Judge',
+    locked: true,
+  }).select().single();
+  created.pitchScoreIds = created.pitchScoreIds || [];
+  created.pitchScoreIds.push(overrideScoreRow.id);
 
-  await admin.from('judge_scores').upsert({ judge_id: overrideJudge.id, pitch_id: qqPitch.id, criterion: 'problem_market', score: 6, locked: true }, { onConflict: 'judge_id,pitch_id,criterion' });
-  const { data: scoreRow } = await admin.from('judge_scores').select('id, score').eq('judge_id', overrideJudge.id).eq('pitch_id', qqPitch.id).eq('criterion', 'problem_market').single();
-
-  const oldScore = scoreRow.score;
+  const oldScore = overrideScoreRow.problem_market_raw;
   const newScore = 9;
   const overrideNote = 'Judge scoresheet had a legible 9, transcribed as 6 by mistake — corrected after cross-check.';
-  await admin.from('judge_scores').update({ score: newScore, locked: true }).eq('id', scoreRow.id);
+  await admin.from('pitch_scores').update({ problem_market_raw: newScore }).eq('id', overrideScoreRow.id);
   const { data: auditInsert, error: auditInsertErr } = await admin.from('score_audit_log').insert({
-    changed_by: overrideOrgUser.user.id, table_changed: 'judge_scores', row_id: scoreRow.id,
-    old_value: { score: oldScore }, new_value: { score: newScore }, note: overrideNote,
+    changed_by: overrideOrgUser.user.id, table_changed: 'pitch_scores', row_id: overrideScoreRow.id,
+    old_value: { problem_market_raw: oldScore }, new_value: { problem_market_raw: newScore }, note: overrideNote,
   }).select().single();
 
   step('score_audit_log row inserted for override', !auditInsertErr && !!auditInsert);
   step(
     'Audit row has correct old value, new value, actor, timestamp, note',
-    auditInsert.old_value.score === oldScore && auditInsert.new_value.score === newScore && auditInsert.changed_by === overrideOrgUser.user.id && !!auditInsert.timestamp && auditInsert.note === overrideNote,
+    auditInsert.old_value.problem_market_raw === oldScore && auditInsert.new_value.problem_market_raw === newScore && auditInsert.changed_by === overrideOrgUser.user.id && !!auditInsert.timestamp && auditInsert.note === overrideNote,
     `row: ${JSON.stringify(auditInsert)}`
   );
 
-  console.log('\n=== Unlock Judge Score flow ===');
-  const { data: scoreAfterOverride } = await admin.from('judge_scores').select('locked').eq('id', scoreRow.id).single();
-  step('Score is locked before unlock', scoreAfterOverride.locked === true);
+  console.log('\n=== Unlock Pitch Score flow ===');
+  // In the single-row model, "unlock" means deleting the locked row so a
+  // judge/organiser can submit fresh (mirrors unlockPitchScoreAction —
+  // there's no partial "unlock and edit in place", the row IS the lock).
+  const { data: scoreBeforeUnlock } = await admin.from('pitch_scores').select('locked').eq('id', overrideScoreRow.id).single();
+  step('Score is locked before unlock', scoreBeforeUnlock.locked === true);
 
-  await admin.from('judge_scores').update({ locked: false }).eq('id', scoreRow.id);
   await admin.from('score_audit_log').insert({
-    changed_by: overrideOrgUser.user.id, table_changed: 'judge_scores', row_id: scoreRow.id,
-    old_value: { locked: true }, new_value: { locked: false }, note: '[UNLOCK SCORE]: allow judge to correct after event feedback',
+    changed_by: overrideOrgUser.user.id, table_changed: 'pitch_scores', row_id: overrideScoreRow.id,
+    old_value: { locked: true }, new_value: null, note: '[UNLOCK SCORE]: allow judge to correct after event feedback',
   });
+  await admin.from('pitch_scores').delete().eq('id', overrideScoreRow.id);
 
-  const { data: unlockedRow } = await admin.from('judge_scores').select('locked').eq('id', scoreRow.id).single();
-  step('Score is unlocked (locked=false) after unlock action', unlockedRow.locked === false);
+  const { data: rowAfterUnlock } = await admin.from('pitch_scores').select('id').eq('id', overrideScoreRow.id).maybeSingle();
+  step('Locked pitch_scores row is gone after unlock (delete-to-unlock model)', !rowAfterUnlock);
 
-  // Now the previously-locked judge can resubmit (mirrors submitJudgeScoresAction's lock check)
-  const { data: existingScoresForResubmit } = await admin.from('judge_scores').select('locked').eq('judge_id', overrideJudge.id).eq('pitch_id', qqPitch.id);
-  const anyStillLocked = existingScoresForResubmit.some((s) => s.locked);
-  step('submitJudgeScoresAction lock-check no longer blocks resubmission (no rows still locked for this judge/pitch)', !anyStillLocked, `locked flags: ${existingScoresForResubmit.map(s=>s.locked).join(',')}`);
-
-  const { error: resubmitErr } = await admin.from('judge_scores').upsert(
-    { judge_id: overrideJudge.id, pitch_id: qqPitch.id, criterion: 'problem_market', score: 10, locked: true },
-    { onConflict: 'judge_id,pitch_id,criterion' }
-  );
+  // A fresh submission for the same pitch now succeeds again.
+  const { data: resubmitRow, error: resubmitErr } = await admin.from('pitch_scores').insert({
+    pitch_id: qqPitch.id,
+    problem_market_raw: 10,
+    solution_innovation_raw: 10,
+    feasibility_raw: 10,
+    pitch_storytelling_raw: 10,
+    submitted_by_name: 'Judge (resubmit after unlock)',
+    locked: true,
+  }).select().single();
+  if (resubmitRow) created.pitchScoreIds.push(resubmitRow.id);
   step('Judge can resubmit after unlock', !resubmitErr, resubmitErr?.message);
 
   console.log('');
@@ -266,7 +306,7 @@ async function cleanup() {
   }
   for (const pid of created.pitchIds) {
     await admin.from('questions').delete().eq('pitch_id', pid);
-    await admin.from('judge_scores').delete().eq('pitch_id', pid);
+    await admin.from('pitch_scores').delete().eq('pitch_id', pid);
     await admin.from('pitches').delete().eq('id', pid);
   }
   for (const jid of created.judgeIds) {

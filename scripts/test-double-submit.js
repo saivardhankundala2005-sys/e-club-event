@@ -32,9 +32,15 @@ async function main() {
     auth_user_id: userB.user.id, team_name: `RACE-PITCHER-${RUN_ID}`, domain: domains[0].name, pool: 'B', status: 'registered',
   }).select().single();
 
-  const { data: pitch } = await admin.from('pitches').insert({
-    team_id: pitchTeam.id, round_id: prelimRound.id, status: 'live', pitch_order: 998,
-  }).select().single();
+  // trg_create_prelim_pitch_for_team already inserted a queued prelim
+  // pitch for pitchTeam on the team insert above — read it instead of
+  // inserting a second one, which would collide with pitches'
+  // UNIQUE(team_id, round_id) constraint.
+  const { data: pitch } = await admin.from('pitches')
+    .select('*')
+    .eq('team_id', pitchTeam.id)
+    .eq('round_id', prelimRound.id)
+    .single();
 
   const entries = [
     { criterion: 'problem_relevance', score: 4 },

@@ -5,6 +5,18 @@
  * project using REAL anon-key sessions (not service role) so RLS is
  * actually exercised, not bypassed.
  *
+ * Rewritten for the post-dry-run-overhaul schema:
+ *   - pitches are auto-created by trg_create_prelim_pitch_for_team on team
+ *     insert, not inserted manually.
+ *   - Judge scoring is single-row pitch_scores (raw 0-10), not multi-judge
+ *     judge_scores.
+ *   - Q&A point ledger is points_pitching/points_asking under the new
+ *     well=+2/+2, poorly=+0/+1, rejected=0/0 rule, aggregated per-team and
+ *     min-max normalized into a 0-10 QA component (no more 50-point floor).
+ *   - Adds real RLS checks for results_revealed gating (section 3) and
+ *     cross-pool question submission (section 5), which didn't exist
+ *     before this overhaul.
+ *
  * All test rows are tagged with a unique run ID and deleted at the end.
  */
 const { loadEnvLocal } = require('./_load-env');
@@ -61,6 +73,15 @@ async function createTeamUser(emailPrefix, pool, teamNameSuffix) {
   return { authId: u.user.id, email, team };
 }
 
+// trg_create_prelim_pitch_for_team already created a queued prelim pitch
+// for this team on insert — read it rather than inserting a second one,
+// which would collide with pitches' UNIQUE(team_id, round_id).
+async function getAutoCreatedPitch(teamId, roundId) {
+  const { data: pitch, error } = await admin.from('pitches').select('*').eq('team_id', teamId).eq('round_id', roundId).single();
+  if (error || !pitch) throw new Error(`No auto-created pitch found for team ${teamId}: ${error?.message}`);
+  return pitch;
+}
+
 async function main() {
   console.log(`\nPre-event checklist run (id: ${RUN_ID})\n=== RLS: Voting rules ===`);
 
@@ -70,9 +91,9 @@ async function main() {
   const teamB = await createTeamUser('rls-teamB', 'B', 'B');
   const teamA2 = await createTeamUser('rls-teamA2', 'A', 'A2'); // same pool as teamA
 
-  const { data: pitchA } = await admin.from('pitches').insert({ team_id: teamA.team.id, round_id: prelimRound.id, status: 'live', pitch_order: 990 }).select().single();
+  const pitchA = await getAutoCreatedPitch(teamA.team.id, prelimRound.id);
   created.pitchIds.push(pitchA.id);
-  const { data: pitchB } = await admin.from('pitches').insert({ team_id: teamB.team.id, round_id: prelimRound.id, status: 'live', pitch_order: 991 }).select().single();
+  const pitchB = await getAutoCreatedPitch(teamB.team.id, prelimRound.id);
   created.pitchIds.push(pitchB.id);
 
   const ratingPayload = (teamId, pitchId) => ([
@@ -107,12 +128,45 @@ async function main() {
   const { error: samePoolErr } = await clientA2.from('audience_scores').insert(ratingPayload(teamA2.team.id, pitchA.id));
   step('Same-pool team voting is REJECTED by RLS', !!samePoolErr, samePoolErr ? `${samePoolErr.code}: ${samePoolErr.message}` : 'NOT REJECTED — same-pool vote succeeded!');
 
-  console.log('\n=== RLS: judge_scores / team_members read restriction (20260813 hardening) ===');
-  // team account should NOT be able to read raw judge_scores rows (belongs to organiser/owning judge only)
-  const { data: judgeScoresAsTeam, error: jsReadErr } = await clientB.from('judge_scores').select('*').limit(1);
-  const teamCannotReadJudgeScores = (jsReadErr) || (judgeScoresAsTeam && judgeScoresAsTeam.length === 0);
-  step('Team account cannot read judge_scores rows directly', teamCannotReadJudgeScores, jsReadErr ? jsReadErr.message : `rows returned: ${judgeScoresAsTeam?.length}`);
+  console.log('\n=== RLS: cross-pool question submission (section 5) ===');
+  // Same shape as audience voting: opposite-pool succeeds, same-pool/self rejected, at the RLS layer.
+  const { error: qOppositeErr } = await clientB.from('questions').insert({ asking_team_id: teamB.team.id, pitch_id: pitchA.id, question_text: 'Opposite pool question, should succeed', status: 'pending' });
+  step('Opposite-pool team submits question: RLS allows insert', !qOppositeErr, qOppositeErr?.message);
 
+  const { error: qSelfErr } = await clientA.from('questions').insert({ asking_team_id: teamA.team.id, pitch_id: pitchA.id, question_text: 'Self question, should be rejected', status: 'pending' });
+  step('Team submitting a question for its own pitch is REJECTED by RLS', !!qSelfErr, qSelfErr ? `${qSelfErr.code}: ${qSelfErr.message}` : 'NOT REJECTED — self-question succeeded!');
+
+  const { error: qSamePoolErr } = await clientA2.from('questions').insert({ asking_team_id: teamA2.team.id, pitch_id: pitchA.id, question_text: 'Same-pool question, should be rejected', status: 'pending' });
+  step('Same-pool team question submission is REJECTED by RLS', !!qSamePoolErr, qSamePoolErr ? `${qSamePoolErr.code}: ${qSamePoolErr.message}` : 'NOT REJECTED — same-pool question succeeded!');
+
+  console.log('\n=== RLS: results_revealed gating (section 3) ===');
+  // Ensure the singleton event_state row starts with results_revealed=false for this check.
+  await admin.from('event_state').update({ results_revealed: false }).eq('id', 1);
+
+  const { data: scoresPreReveal, error: scoresPreRevealErr } = await clientB.from('pitch_scores').select('*').limit(1);
+  const teamBlockedPreReveal = !!scoresPreRevealErr || (scoresPreReveal && scoresPreReveal.length === 0);
+  step('Team account cannot read pitch_scores before results_revealed=true', teamBlockedPreReveal, scoresPreRevealErr ? scoresPreRevealErr.message : `rows returned: ${scoresPreReveal?.length}`);
+
+  const { data: audiencePreReveal, error: audiencePreRevealErr } = await clientB.from('audience_scores').select('*').eq('pitch_id', pitchA.id).limit(1);
+  // Note: clientB is the voter here, so it CAN read its own inserted rows only if a
+  // separate "read own vote" policy existed — under this schema, pre-reveal team reads
+  // of audience_scores are gated the same as pitch_scores, so this should also be empty/error
+  // UNLESS the row belongs to clientB itself and RLS doesn't distinguish "own row" for SELECT.
+  // The migration's SELECT policy for audience_scores does not carve out "own row", so this
+  // must be blocked too.
+  const audienceBlockedPreReveal = !!audiencePreRevealErr || (audiencePreReveal && audiencePreReveal.length === 0);
+  step('Team account cannot read audience_scores before results_revealed=true', audienceBlockedPreReveal, audiencePreRevealErr ? audiencePreRevealErr.message : `rows returned: ${audiencePreReveal?.length}`);
+
+  await admin.from('event_state').update({ results_revealed: true }).eq('id', 1);
+  await new Promise((r) => setTimeout(r, 300));
+
+  const { data: scoresPostReveal, error: scoresPostRevealErr } = await clientB.from('pitch_scores').select('*').limit(1);
+  step('Team account CAN read pitch_scores after results_revealed=true', !scoresPostRevealErr, scoresPostRevealErr?.message);
+
+  // Reset for the rest of the run so later sections aren't affected by reveal state.
+  await admin.from('event_state').update({ results_revealed: false }).eq('id', 1);
+
+  console.log('\n=== RLS: pitch_scores / team_members read restriction ===');
   // team account should NOT be able to read other teams' team_members (emails)
   const { data: membersAsTeam, error: memReadErr } = await clientB.from('team_members').select('*').eq('team_id', teamA.team.id);
   const teamCannotReadOtherMembers = (memReadErr) || (membersAsTeam && membersAsTeam.length === 0);
@@ -133,6 +187,8 @@ async function main() {
   const sanitizedSqli = sanitize(sqliPayload);
   const sanitizedXss = sanitize(xssPayload);
 
+  // Use clientB (opposite pool to pitchB's own team) so RLS's cross-pool
+  // check doesn't block this insert for reasons unrelated to sanitization.
   const { error: qInsertErr } = await clientA.from('questions').insert({
     asking_team_id: teamA.team.id, pitch_id: pitchB.id, question_text: sanitizedSqli, status: 'pending',
   });
@@ -158,7 +214,6 @@ async function main() {
   step('Team role fails requireRole("organiser") check used by manualOverrideScoreAction etc.', wouldBeRejected, `role=${teamProfile.role}`);
 
   console.log('\n=== Security: malformed UUID handling ===');
-  const { isValidUUIDCheck } = {};
   function isValidUUID(uuid) {
     if (!uuid || typeof uuid !== 'string') return false;
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uuid.trim());
@@ -175,68 +230,63 @@ async function main() {
   step('Malformed UUID in query param handled gracefully (no 500-style crash)', noCrash, badQueryErr ? `${badQueryErr.code}: ${badQueryErr.message}` : 'no error returned');
 
   console.log('\n=== Leaderboard math hand-verification ===');
-  const judgeUser = await admin.auth.admin.createUser({ email: `rls-judge-${RUN_ID}@student.nitw.ac.in`, email_confirm: true });
-  created.authUsers.push(judgeUser.data.user.id);
-  await admin.from('profiles').upsert({ id: judgeUser.data.user.id, email: judgeUser.data.user.email, role: 'judge', full_name: 'RLS Judge' });
-  const { data: judge } = await admin.from('judges').insert({ auth_user_id: judgeUser.data.user.id, name: 'RLS Judge', email: judgeUser.data.user.email }).select().single();
-  created.judgeIds.push(judge.id);
+  // pitchB gets a single-row pitch_scores submission (raw 0-10 scale).
+  const scoreSet = { problem_market_raw: 7, solution_innovation_raw: 6, feasibility_raw: 9, pitch_storytelling_raw: 8 };
+  const { data: pitchBScore } = await admin.from('pitch_scores').insert({
+    pitch_id: pitchB.id,
+    ...scoreSet,
+    submitted_by_name: 'RLS Judge',
+    locked: true,
+  }).select().single();
 
-  const scoreSet = { problem_market: 7, solution_innovation: 6, feasibility: 9, pitch_storytelling: 8 };
-  for (const [criterion, score] of Object.entries(scoreSet)) {
-    await admin.from('judge_scores').upsert({ judge_id: judge.id, pitch_id: pitchB.id, criterion, score, locked: true }, { onConflict: 'judge_id,pitch_id,criterion' });
-  }
-
-  // approve one question for pitchB with +1 to team
+  // Approve one question for pitchB (pitching team=teamB) asked by teamA,
+  // answered well -> pitching +2, asking +2 under the new point rule.
   const { data: qb } = await admin.from('questions').insert({ asking_team_id: teamA.team.id, pitch_id: pitchB.id, question_text: 'hand-calc test question', status: 'pending' }).select().single();
-  await admin.from('questions').update({ status: 'approved', outcome: 'team_answered_well', points_to_team: 1, points_to_asker: 0 }).eq('id', qb.id);
+  await admin.from('questions').update({ status: 'approved', outcome: 'team_answered_well', points_pitching: 2, points_asking: 2 }).eq('id', qb.id);
 
   await new Promise((r) => setTimeout(r, 600));
   const { data: lbRow } = await admin.from('pitch_leaderboard').select('*').eq('pitch_id', pitchB.id).single();
 
-  // Hand calculation
+  // Hand calculation matching pitch_leaderboard's actual formula:
+  //   judge components: raw * 10 (0-100 basis), weighted 0.20/0.20/0.15/0.15
+  //   audience: pitchB had no votes -> 0
+  //   QA: min-max normalized across ALL teams in this run. teamB's raw_qa_points
+  //     (pitching, since the approved question was asked AT pitchB) = 2.
+  //     teamA's raw_qa_points (asking) = 2. Every other team in this run = 0.
+  //     min=0, max=2 -> teamB's qa_component = (2-0)/(2-0)*10 = 10.
   const jc = {
-    problem_market_score: scoreSet.problem_market * 10,
-    solution_innovation_score: scoreSet.solution_innovation * 10,
-    feasibility_score: scoreSet.feasibility * 10,
-    pitch_storytelling_score: scoreSet.pitch_storytelling * 10,
+    problem_market_score: scoreSet.problem_market_raw * 10,
+    solution_innovation_score: scoreSet.solution_innovation_raw * 10,
+    feasibility_score: scoreSet.feasibility_raw * 10,
+    pitch_storytelling_score: scoreSet.pitch_storytelling_raw * 10,
   };
-  // audience: teamB (pitching) got votes from clientB earlier? No — teamB is the PITCHER for pitchB in this section, audience_scores were for pitchA.
-  // pitchB had no audience votes -> audience_rating_score = 0 (COALESCE default)
   const audienceScore = 0;
-  const qaScore = Math.min(Math.max(50 + 1 * 10, 0), 100); // 60
+  const qaComponent = 10; // teamB is tied for max raw_qa_points (2) among this run's teams, min=0 -> normalized to 10
   const handCalc = (
     jc.problem_market_score * 0.20 +
     jc.solution_innovation_score * 0.20 +
     jc.feasibility_score * 0.15 +
     jc.pitch_storytelling_score * 0.15 +
     audienceScore * 0.20 +
-    qaScore * 0.10
+    qaComponent
   );
   const handCalcRounded = Math.round(handCalc * 100) / 100;
 
-  console.log(`Hand-calculated: problem_market=${jc.problem_market_score}*0.20 + solution_innovation=${jc.solution_innovation_score}*0.20 + feasibility=${jc.feasibility_score}*0.15 + storytelling=${jc.pitch_storytelling_score}*0.15 + audience=${audienceScore}*0.20 + qa=${qaScore}*0.10 = ${handCalcRounded}`);
-  console.log(`DB view total_weighted_score: ${lbRow.total_weighted_score}`);
-  step('Hand-calculated weighted score EXACTLY matches pitch_leaderboard view', Number(lbRow.total_weighted_score) === handCalcRounded, `hand=${handCalcRounded} db=${lbRow.total_weighted_score}`);
+  console.log(`Hand-calculated: problem_market=${jc.problem_market_score}*0.20 + solution_innovation=${jc.solution_innovation_score}*0.20 + feasibility=${jc.feasibility_score}*0.15 + storytelling=${jc.pitch_storytelling_score}*0.15 + audience=${audienceScore}*0.20 + qa_component=${qaComponent} = ${handCalcRounded}`);
+  console.log(`DB view total_weighted_score: ${lbRow.total_weighted_score}, total_qa_points: ${lbRow.total_qa_points}, qa_pressure_score: ${lbRow.qa_pressure_score}`);
+  step(
+    'Hand-calculated weighted score matches pitch_leaderboard view (within QA normalization scope of this run\'s teams)',
+    Math.abs(Number(lbRow.total_weighted_score) - handCalcRounded) < 0.01,
+    `hand=${handCalcRounded} db=${lbRow.total_weighted_score}`
+  );
 
   console.log('\n=== Final 4 qualification logic ===');
   // Build a deliberately skewed dataset where top-2-per-pool DIFFERS from top-4-overall,
   // so the test actually distinguishes correct pool-based logic from a naive overall-top-4 bug.
-  // Pool A: three teams scored 95, 90, 20 (award pattern via judge scores only, audience/qa=0)
-  // Pool B: three teams scored 15, 12, 10
-  // top-4-overall would be [A-95, A-90, B-15... wait B never reaches top4] -> use scores that force the distinction:
-  // Pool A: 95, 92, 10   Pool B: 30, 28, 5
-  // top-2-per-pool = {A-95, A-92, B-30, B-28}
-  // top-4-overall  = {A-95, A-92, B-30, B-28, A-10?} -- overall top4 = A95,A92,B30,B28 too (same, since A-10 and B-5 both low)
-  // To truly force a mismatch, Pool A must have a 3rd team that outranks Pool B's 2nd:
   // Pool A: 95, 92, 60   Pool B: 30, 28, 5
   // top-2-per-pool = {A-95, A-92, B-30, B-28}
   // top-4-overall  = {A-95, A-92, A-60, B-30}  <-- differs! (drops B-28, includes A-60)
   const finalFourRound = { A: [95, 92, 60], B: [30, 28, 5] };
-  const f4Judge = await admin.auth.admin.createUser({ email: `f4-judge-${RUN_ID}@student.nitw.ac.in`, email_confirm: true });
-  created.authUsers.push(f4Judge.data.user.id);
-  await admin.from('profiles').upsert({ id: f4Judge.data.user.id, email: f4Judge.data.user.email, role: 'judge', full_name: 'F4 Judge' });
-  const { data: f4JudgeRow } = await admin.from('judges').insert({ auth_user_id: f4Judge.data.user.id, name: 'F4 Judge', email: f4Judge.data.user.email }).select().single();
-  created.judgeIds.push(f4JudgeRow.id);
 
   const { data: domainsForF4 } = await admin.from('domains').select('name').limit(1);
   const f4Teams = {};
@@ -245,19 +295,25 @@ async function main() {
     for (let i = 0; i < finalFourRound[pool].length; i++) {
       const targetTotal = finalFourRound[pool][i]; // score out of 100, achieved via judge criteria only (audience/qa = 0)
       // total_weighted_score = judge criteria weighted at 0.20+0.20+0.15+0.15=0.70 of a 0-100 judge score (all 4 criteria equal)
-      // set all 4 criteria to the same raw score S (1-10) => each *10 = S*10 (0-100), weighted sum = S*10*0.70 = 7*S
-      // solve S = targetTotal / 7, clamp 1-10
-      const rawS = Math.max(1, Math.min(10, Math.round(targetTotal / 7)));
+      // set all 4 criteria to the same raw score S (0-10) => each *10 = S*10 (0-100), weighted sum = S*10*0.70 = 7*S
+      // solve S = targetTotal / 7, clamp 0-10
+      const rawS = Math.max(0, Math.min(10, Math.round(targetTotal / 7)));
       const u = await admin.auth.admin.createUser({ email: `f4-${pool}${i}-${RUN_ID}@example.com`, email_confirm: true });
       created.authUsers.push(u.data.user.id);
       await admin.from('profiles').upsert({ id: u.data.user.id, email: u.data.user.email, role: 'team', full_name: `F4 ${pool}${i}` });
       const { data: t } = await admin.from('teams').insert({ auth_user_id: u.data.user.id, team_name: `F4-${pool}${i}-${RUN_ID}`, domain: domainsForF4[0].name, pool, status: 'registered' }).select().single();
       created.teamIds.push(t.id);
-      const { data: p } = await admin.from('pitches').insert({ team_id: t.id, round_id: prelimRound.id, status: 'done', pitch_order: 900 + i }).select().single();
+      const p = await getAutoCreatedPitch(t.id, prelimRound.id);
       created.pitchIds.push(p.id);
-      for (const criterion of ['problem_market', 'solution_innovation', 'feasibility', 'pitch_storytelling']) {
-        await admin.from('judge_scores').upsert({ judge_id: f4JudgeRow.id, pitch_id: p.id, criterion, score: rawS, locked: true }, { onConflict: 'judge_id,pitch_id,criterion' });
-      }
+      await admin.from('pitch_scores').insert({
+        pitch_id: p.id,
+        problem_market_raw: rawS,
+        solution_innovation_raw: rawS,
+        feasibility_raw: rawS,
+        pitch_storytelling_raw: rawS,
+        submitted_by_name: 'F4 Judge',
+        locked: true,
+      });
       f4Teams[pool].push({ team_id: t.id, team_name: t.team_name, pitch_id: p.id, rawS });
     }
   }
@@ -265,7 +321,7 @@ async function main() {
   await new Promise((r) => setTimeout(r, 600));
   const { data: f4Lb } = await admin.from('pitch_leaderboard').select('*').in('pitch_id', [...f4Teams.A, ...f4Teams.B].map((t) => t.pitch_id));
 
-  // This mirrors qualifyFinalFourAction's exact logic (organiserActions.ts:326-350)
+  // This mirrors qualifyFinalFourAction's exact logic (organiserActions.ts)
   const poolA = f4Lb.filter((r) => r.pool === 'A').sort((a, b) => b.total_weighted_score - a.total_weighted_score);
   const poolB = f4Lb.filter((r) => r.pool === 'B').sort((a, b) => b.total_weighted_score - a.total_weighted_score);
   const appLogicResult = [...poolA.slice(0, 2), ...poolB.slice(0, 2)].map((r) => r.team_name).sort();
@@ -278,7 +334,7 @@ async function main() {
   const distinguishing = JSON.stringify(appLogicResult) !== JSON.stringify(top4OverallResult);
   step('Test dataset actually distinguishes top-2-per-pool from top-4-overall', distinguishing);
   const expectedTop2PerPool = [`F4-A0-${RUN_ID}`, `F4-A1-${RUN_ID}`, `F4-B0-${RUN_ID}`, `F4-B1-${RUN_ID}`].sort();
-  step('qualifyFinalFourAction logic (code-reviewed against organiserActions.ts:336-344) picks top-2-per-pool, matching hand calculation', JSON.stringify(appLogicResult) === JSON.stringify(expectedTop2PerPool), `got=${JSON.stringify(appLogicResult)} expected=${JSON.stringify(expectedTop2PerPool)}`);
+  step('qualifyFinalFourAction logic (code-reviewed against organiserActions.ts) picks top-2-per-pool, matching hand calculation', JSON.stringify(appLogicResult) === JSON.stringify(expectedTop2PerPool), `got=${JSON.stringify(appLogicResult)} expected=${JSON.stringify(expectedTop2PerPool)}`);
 
   console.log('');
 }
@@ -288,7 +344,7 @@ async function cleanup() {
   for (const pid of created.pitchIds) {
     await admin.from('questions').delete().eq('pitch_id', pid);
     await admin.from('audience_scores').delete().eq('pitch_id', pid);
-    await admin.from('judge_scores').delete().eq('pitch_id', pid);
+    await admin.from('pitch_scores').delete().eq('pitch_id', pid);
     await admin.from('pitches').delete().eq('id', pid);
   }
   for (const jid of created.judgeIds) {
@@ -302,6 +358,8 @@ async function cleanup() {
     await admin.from('profiles').delete().eq('id', uid);
     await admin.auth.admin.deleteUser(uid).catch(() => {});
   }
+  // Ensure results_revealed is left in its default (false) state.
+  await admin.from('event_state').update({ results_revealed: false }).eq('id', 1);
   console.log('Cleanup done.\n');
 }
 

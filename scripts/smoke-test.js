@@ -8,13 +8,22 @@
  * performs without needing a running dev server or real OTP email
  * delivery.
  *
+ * Rewritten for the post-dry-run-overhaul schema:
+ *   - pitches are created automatically by trg_create_prelim_pitch_for_team
+ *     on team insert (not inserted manually — that now races the trigger's
+ *     UNIQUE(team_id, round_id) and fails).
+ *   - Judge scoring is single-row-per-pitch via pitch_scores on a raw 0-10
+ *     scale (locked on first insert), not multi-judge judge_scores rows.
+ *   - pitch_leaderboard.total_weighted_score is NULL (not a number) until
+ *     pitch_scores has a row for that pitch.
+ *
  * Path covered:
- *   1. Team registration (random domain + pool assignment)
- *   2. Judge login/account resolution
- *   3. Judge submits a full rubric score for the team's pitch
- *   4. Score lock is verified (re-submit is rejected)
- *   5. pitch_leaderboard view reflects the submitted score
- *   6. Organiser manual override changes a score
+ *   1. Team registration (auto-creates a queued prelim pitch via trigger)
+ *   2. Judge/organiser account resolution
+ *   3. Single-row pitch score submitted (raw 0-10 scale)
+ *   4. Lock verification: a second submission for the same pitch is rejected
+ *   5. pitch_leaderboard reflects the submitted score with correct math
+ *   6. Organiser manual override changes a raw score column
  *   7. score_audit_log entry was created for the override
  *
  * All test rows are tagged with a unique run ID and deleted at the end,
@@ -56,6 +65,7 @@ const created = {
   teamId: null,
   judgeId: null,
   pitchId: null,
+  pitchScoreId: null,
   roundId: null,
 };
 
@@ -127,12 +137,18 @@ async function main() {
     dupTeamErr ? `blocked as expected (${dupTeamErr.code})` : 'NOT BLOCKED — duplicate team was created!'
   );
 
+  // Pitch row is NOT inserted manually — trg_create_prelim_pitch_for_team
+  // already created a queued prelim pitch for this team on insert above.
+  // Inserting a second one here would collide with pitches'
+  // UNIQUE(team_id, round_id) constraint that backs the trigger's
+  // ON CONFLICT DO NOTHING.
   const { data: pitch, error: pitchErr } = await admin
     .from('pitches')
-    .insert({ team_id: team.id, round_id: created.roundId, status: 'live', pitch_order: 999, started_at: new Date().toISOString() })
-    .select()
-    .single();
-  if (!step('Pitch created for team', !pitchErr && !!pitch, pitchErr?.message)) throw new Error('halt');
+    .select('*')
+    .eq('team_id', team.id)
+    .eq('round_id', created.roundId)
+    .maybeSingle();
+  if (!step('Prelim pitch auto-created by trigger on team registration', !pitchErr && !!pitch, !pitch && !pitchErr ? 'no pitch row found for team' : pitchErr?.message)) throw new Error('halt');
   created.pitchId = pitch.id;
 
   // --- 2. Judge login / account resolution ---
@@ -146,73 +162,91 @@ async function main() {
   if (!step('Judge account resolves', !judgeErr && !!judge, judgeErr?.message)) throw new Error('halt');
   created.judgeId = judge.id;
 
-  // --- 3. Judge submits full rubric score (mirrors submitJudgeScoresAction) ---
-  const scoreEntries = [
-    { criterion: 'problem_market', score: 8 },
-    { criterion: 'solution_innovation', score: 9 },
-    { criterion: 'feasibility', score: 7 },
-    { criterion: 'pitch_storytelling', score: 8 },
-  ];
-  for (const entry of scoreEntries) {
-    const { error } = await admin.from('judge_scores').upsert(
-      { judge_id: judge.id, pitch_id: pitch.id, criterion: entry.criterion, score: entry.score, locked: true },
-      { onConflict: 'judge_id,pitch_id,criterion' }
-    );
-    if (error) { step(`Judge score submitted (${entry.criterion})`, false, error.message); throw new Error('halt'); }
-  }
-  step('Judge submits all 4 rubric scores, locked=true', true);
+  // --- 3. Judge submits the single authoritative pitch score (mirrors
+  // submitPitchScoreAction: raw 0-10 per category, locked on insert) ---
+  const { data: pitchScore, error: scoreErr } = await admin
+    .from('pitch_scores')
+    .insert({
+      pitch_id: pitch.id,
+      problem_market_raw: 8,
+      solution_innovation_raw: 9,
+      feasibility_raw: 7,
+      pitch_storytelling_raw: 8,
+      submitted_by: judgeAuthId,
+      submitted_by_name: 'Smoke Judge',
+      locked: true,
+    })
+    .select()
+    .single();
+  if (!step('Judge submits pitch_scores row (raw 0-10 scale), locked=true', !scoreErr && !!pitchScore, scoreErr?.message)) throw new Error('halt');
+  created.pitchScoreId = pitchScore.id;
 
-  // --- 4. Lock verification: re-submit should be rejected at the app layer ---
-  // (mirrors submitJudgeScoresAction's explicit lock check, since the admin
-  // client bypasses RLS and would otherwise silently overwrite)
-  const { data: lockCheck } = await admin
-    .from('judge_scores')
-    .select('locked')
-    .eq('judge_id', judge.id)
-    .eq('pitch_id', pitch.id);
-  const allLocked = lockCheck.every((s) => s.locked === true);
-  step('All 4 judge_scores rows are locked=true after submit', allLocked);
+  // --- 4. Lock verification: a second submission for the same pitch must
+  // be rejected by the UNIQUE(pitch_id) constraint (this IS the lock —
+  // there's no separate locked-row-update path in the single-row model) ---
+  const { error: dupScoreErr } = await admin
+    .from('pitch_scores')
+    .insert({
+      pitch_id: pitch.id,
+      problem_market_raw: 1,
+      solution_innovation_raw: 1,
+      feasibility_raw: 1,
+      pitch_storytelling_raw: 1,
+      submitted_by: judgeAuthId,
+      submitted_by_name: 'Second Judge (should be rejected)',
+      locked: true,
+    });
+  step(
+    'Second score submission for the same pitch is rejected (UNIQUE pitch_id)',
+    !!dupScoreErr && dupScoreErr.code === '23505',
+    dupScoreErr ? `blocked as expected (${dupScoreErr.code})` : 'NOT BLOCKED — duplicate pitch_scores row was created!'
+  );
 
-  // --- 5. Leaderboard reflects the score ---
+  // --- 5. Leaderboard reflects the score with correct weighted math ---
   await new Promise((r) => setTimeout(r, 500)); // let the view settle
   const { data: leaderboardRow, error: lbErr } = await admin
     .from('pitch_leaderboard')
     .select('*')
     .eq('pitch_id', pitch.id)
     .maybeSingle();
-  const lbOk = !lbErr && !!leaderboardRow && leaderboardRow.judges_submitted_count === 1;
+  const lbOk = !lbErr && !!leaderboardRow && leaderboardRow.judges_submitted_count === 1 && leaderboardRow.total_weighted_score !== null;
   step(
-    'pitch_leaderboard reflects the submitted score',
+    'pitch_leaderboard reflects the submitted score (judges_submitted_count=1, non-null total)',
     lbOk,
     lbErr?.message || (leaderboardRow ? `judges_submitted_count=${leaderboardRow.judges_submitted_count}, total=${leaderboardRow.total_weighted_score}` : 'no row returned')
   );
 
-  // --- 6. Organiser manual override ---
+  // Expected: problem_market 8*10*0.20=16, solution_innovation 9*10*0.20=18,
+  // feasibility 7*10*0.15=10.5, storytelling 8*10*0.15=12 -> judge-only
+  // subtotal 56.5 (audience/QA add on top; both 0 for a fresh test pitch
+  // with no votes/questions, so total should equal 56.5 exactly).
+  const expectedJudgeOnly = 8 * 10 * 0.2 + 9 * 10 * 0.2 + 7 * 10 * 0.15 + 8 * 10 * 0.15;
+  const mathOk = lbOk && Math.abs(leaderboardRow.total_weighted_score - expectedJudgeOnly) < 0.01;
+  step(
+    `Weighted total matches hand-calculated value (expected ${expectedJudgeOnly})`,
+    mathOk,
+    lbOk ? `got ${leaderboardRow.total_weighted_score}` : 'skipped, leaderboard row missing'
+  );
+
+  // --- 6. Organiser manual override (mirrors manualOverrideScoreAction:
+  // writes the raw 0-10 column directly, same scale judges see) ---
   const orgAuthId = await createAuthUser(ORGANISER_EMAIL);
   await admin.from('profiles').upsert({ id: orgAuthId, email: ORGANISER_EMAIL, role: 'organiser', full_name: 'Smoke Organiser' });
 
-  const { data: scoreRowToOverride } = await admin
-    .from('judge_scores')
-    .select('id, score')
-    .eq('judge_id', judge.id)
-    .eq('pitch_id', pitch.id)
-    .eq('criterion', 'problem_market')
-    .single();
-
-  const oldScore = scoreRowToOverride.score;
+  const oldScore = pitchScore.problem_market_raw;
   const newScore = 10;
   const { error: overrideErr } = await admin
-    .from('judge_scores')
-    .update({ score: newScore, locked: true })
-    .eq('id', scoreRowToOverride.id);
-  step('Organiser override updates judge_scores', !overrideErr, overrideErr?.message);
+    .from('pitch_scores')
+    .update({ problem_market_raw: newScore })
+    .eq('id', pitchScore.id);
+  step('Organiser override updates pitch_scores raw column', !overrideErr, overrideErr?.message);
 
   const { error: auditErr } = await admin.from('score_audit_log').insert({
     changed_by: orgAuthId,
-    table_changed: 'judge_scores',
-    row_id: scoreRowToOverride.id,
-    old_value: { score: oldScore },
-    new_value: { score: newScore },
+    table_changed: 'pitch_scores',
+    row_id: pitchScore.id,
+    old_value: { problem_market_raw: oldScore },
+    new_value: { problem_market_raw: newScore },
     note: `[SMOKE TEST ${RUN_ID}] automated override verification`,
   });
   step('score_audit_log entry inserted for override', !auditErr, auditErr?.message);
@@ -221,12 +255,12 @@ async function main() {
   const { data: auditRow, error: auditReadErr } = await admin
     .from('score_audit_log')
     .select('*')
-    .eq('row_id', scoreRowToOverride.id)
-    .eq('table_changed', 'judge_scores')
+    .eq('row_id', pitchScore.id)
+    .eq('table_changed', 'pitch_scores')
     .order('timestamp', { ascending: false })
     .limit(1)
     .maybeSingle();
-  const auditOk = !auditReadErr && !!auditRow && auditRow.changed_by === orgAuthId && auditRow.new_value.score === newScore;
+  const auditOk = !auditReadErr && !!auditRow && auditRow.changed_by === orgAuthId && auditRow.new_value.problem_market_raw === newScore;
   step('Audit log entry has correct actor, old/new value, timestamp', auditOk, auditReadErr?.message);
 
   console.log('');
@@ -234,14 +268,8 @@ async function main() {
 
 async function cleanup() {
   console.log('Cleaning up test data...');
-  if (created.pitchId) await admin.from('score_audit_log').delete().eq('row_id', created.pitchId);
-  if (created.judgeId && created.pitchId) {
-    const { data: rows } = await admin.from('judge_scores').select('id').eq('judge_id', created.judgeId).eq('pitch_id', created.pitchId);
-    for (const r of rows || []) {
-      await admin.from('score_audit_log').delete().eq('row_id', r.id);
-    }
-    await admin.from('judge_scores').delete().eq('judge_id', created.judgeId);
-  }
+  if (created.pitchScoreId) await admin.from('score_audit_log').delete().eq('row_id', created.pitchScoreId);
+  if (created.pitchScoreId) await admin.from('pitch_scores').delete().eq('id', created.pitchScoreId);
   if (created.pitchId) await admin.from('pitches').delete().eq('id', created.pitchId);
   if (created.judgeId) await admin.from('judges').delete().eq('id', created.judgeId);
   if (created.teamId) {
