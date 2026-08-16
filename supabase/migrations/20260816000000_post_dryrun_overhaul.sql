@@ -236,6 +236,10 @@ $$;
 
 REVOKE ALL ON FUNCTION public.next_pool_assignment() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.next_pool_assignment() TO authenticated;
+-- registerTeamAction calls this via the service-role admin client, which
+-- does not automatically inherit the `authenticated` grant for RPC calls —
+-- without this, real team registration fails with "permission denied".
+GRANT EXECUTE ON FUNCTION public.next_pool_assignment() TO service_role;
 
 -- Least-assigned-first domain pick: locks the candidate row
 -- (FOR UPDATE SKIP LOCKED-free single-row lock is enough here since we
@@ -275,6 +279,7 @@ $$;
 
 REVOKE ALL ON FUNCTION public.assign_least_used_domain() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.assign_least_used_domain() TO authenticated;
+GRANT EXECUTE ON FUNCTION public.assign_least_used_domain() TO service_role;
 
 -- ============================================================
 -- 6. REWRITE pitch_leaderboard
